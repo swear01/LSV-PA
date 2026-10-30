@@ -16,11 +16,13 @@
 #include <vector>
 
 static int Lsv_CommandPrintNodes(Abc_Frame_t* pAbc, int argc, char** argv);
-static int Lsv_CommandCut(Abc_Frame_t* pAbc, int argc, char** argv);
+static int Lsv_CommandCutTt(Abc_Frame_t* pAbc, int argc, char** argv);
+static int Lsv_CommandCutBddSize(Abc_Frame_t* pAbc, int argc, char** argv);
 
 void init(Abc_Frame_t* pAbc) {
   Cmd_CommandAdd(pAbc, "LSV", "lsv_print_nodes", Lsv_CommandPrintNodes, 0);
-  Cmd_CommandAdd(pAbc, "LSV", "lsv", Lsv_CommandCut, 0);
+  Cmd_CommandAdd(pAbc, "LSV", "lsv_cut_tt", Lsv_CommandCutTt, 0);
+  Cmd_CommandAdd(pAbc, "LSV", "lsv_cut_bddsize", Lsv_CommandCutBddSize, 0);
 }
 
 void destroy(Abc_Frame_t* pAbc) {}
@@ -190,15 +192,15 @@ static DdNode* Lsv_BuildBdd(Abc_Obj_t* node, const LsvCut& cut, DdManager* dd,
 }
 #endif
 
-static int Lsv_CommandCut(Abc_Frame_t* frame, int argc, char** argv) {
-  if (argc != 4 || strcmp(argv[1], "cut") ||
-      (strcmp(argv[2], "tt") && strcmp(argv[2], "bddsize"))) {
-    Abc_Print(-2, "usage: lsv cut {tt|bddsize} <k> (2 <= k <= 6)\n");
+static int Lsv_CommandCut(Abc_Frame_t* frame, int argc, char** argv,
+                          bool bddsize) {
+  if (argc != 2) {
+    Abc_Print(-2, "usage: %s <k> (2 <= k <= 6)\n", argv[0]);
     return 1;
   }
   char* end;
   errno = 0;
-  long k = std::strtol(argv[3], &end, 10);
+  long k = std::strtol(argv[1], &end, 10);
   if (errno || *end || k < 2 || k > 6) {
     Abc_Print(-1, "k must be an integer from 2 to 6.\n");
     return 1;
@@ -209,7 +211,6 @@ static int Lsv_CommandCut(Abc_Frame_t* frame, int argc, char** argv) {
     return 1;
   }
 
-  bool bddsize = !strcmp(argv[2], "bddsize");
 #ifdef ABC_USE_CUDD
   std::unique_ptr<DdManager, decltype(&Cudd_Quit)> dd(
       bddsize ? Cudd_Init(k, 0, CUDD_UNIQUE_SLOTS, CUDD_CACHE_SLOTS, 0) : nullptr,
@@ -259,4 +260,12 @@ static int Lsv_CommandCut(Abc_Frame_t* frame, int argc, char** argv) {
     }
   }
   return 0;
+}
+
+static int Lsv_CommandCutTt(Abc_Frame_t* frame, int argc, char** argv) {
+  return Lsv_CommandCut(frame, argc, argv, false);
+}
+
+static int Lsv_CommandCutBddSize(Abc_Frame_t* frame, int argc, char** argv) {
+  return Lsv_CommandCut(frame, argc, argv, true);
 }
