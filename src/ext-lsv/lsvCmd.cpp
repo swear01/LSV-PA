@@ -262,10 +262,10 @@ static int Lsv_CommandCut(Abc_Frame_t* frame, int argc, char** argv,
   return 0;
 }
 
-int Lsv_CommandCutTt(Abc_Frame_t* frame, int argc, char** argv) {
+static int Lsv_CommandCutTt(Abc_Frame_t* frame, int argc, char** argv) {
   return Lsv_CommandCut(frame, argc, argv, false);
 }
 
-int Lsv_CommandCutBddSize(Abc_Frame_t* frame, int argc, char** argv) {
+static int Lsv_CommandCutBddSize(Abc_Frame_t* frame, int argc, char** argv) {
   return Lsv_CommandCut(frame, argc, argv, true);
 }
