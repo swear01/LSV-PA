@@ -557,7 +557,7 @@ struct LsvKlSat {
       : ntk(ntk), order(order), cut(cut), N(Abc_NtkObjNumMax(ntk)) {
     // Conflict limits: PO-differs call, one node pair, one PO driver; and how many
     // unsettled pairs to tolerate before falling back to Lsv_KlAllowed.
-    limit1 = 100, limit2 = 100, limit3 = 20000, maxUndef = 10;
+    limit1 = 100, limit2 = 1000, limit3 = 20000, maxUndef = 10;
     tfo.assign(N, 0), isRoot.assign(N, 0), pos.assign(N, -1);
     for (unsigned r : cut.roots) tfo[r] = isRoot[r] = 1;
     s = sat_solver_new();
