@@ -542,7 +542,10 @@ static int Lsv_KlSolve(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, un
     // As dsat: the output as a unit clause, faster than an assumption here.
     r = Fra_FraigSat(aig, limit, 0, 0, 0, 0, 0, 0, 0, 0);
     if (r == 0 && cex && aig->pData)
-      for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) cex->push_back(((int*)aig->pData)[i] != 0);
+      for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) {
+        int v = pc[Abc_ObjId(Abc_NtkPi(ntk, i))];
+        cex->push_back(v >= 0 ? v : ((int*)aig->pData)[i] != 0);
+      }
     ABC_FREE(aig->pData);
     Aig_ManStop(aig);
   }
@@ -615,15 +618,46 @@ static bool Lsv_KlGateCube(Abc_Ntk_t* ntk, Vec_Ptr_t* order, unsigned r,
   return true;
 }
 
+// Value v that PO of the original network always has in a case (the PIs fixed
+// by pc, -1: free) under U = u, or -1. Depends on u and pc only, not on c:
+// cached by them.
+typedef std::map<std::pair<unsigned, std::vector<int>>, int> LsvKlConst;
+static int Lsv_KlOrigConst(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned u,
+                           unsigned cu, const std::vector<int>& pc, int limit,
+                           LsvKlConst& cache) {
+  std::pair<unsigned, std::vector<int>> key{u, {}};
+  for (size_t id = 0; id < pc.size(); ++id)
+    if (pc[id] >= 0) key.second.push_back(2 * id + pc[id]);
+  auto it = cache.find(key);
+  if (it != cache.end()) return it->second;
+  int v = -1;
+  for (int pol = 1; pol >= 0 && v < 0; --pol)
+    if (Lsv_KlSolve(ntk, order, cut, u, cu, cu, pc, 1, pol, limit, nullptr) == 1) v = !pol;
+  return cache[key] = v;
+}
+
+// One case: the PIs fixed by pc (-1: free). Returns 1, 0 (cex set) or -1.
+static int Lsv_KlCase(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned u,
+                      unsigned cu, unsigned c, const std::vector<int>& pc, int limit,
+                      std::vector<char>& cex, LsvKlConst& cache) {
+  if (Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 0, 0, -1, nullptr) == 1) return 1;
+  if (Abc_NtkPoNum(ntk) == 1) {
+    // Often both POs are the same constant here: check each side alone, much
+    // easier than the miter.
+    int v = Lsv_KlOrigConst(ntk, order, cut, u, cu, pc, limit, cache);
+    if (v >= 0 && Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 2, !v, limit, nullptr) == 1) return 1;
+  }
+  return Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 0, 0, limit, &cex);
+}
+
 // Decides (u, c) by splitting the inputs along chain (PI literals that gate the
 // roots): case i has literals 0..i-1 true and literal i false, the last case all
 // true. Fixed PIs fold most cases to constant 0 in strash; in a divider the
 // difference only lives where the divisor is tiny. 1 / 0 / -1 as Lsv_KlAllowed.
 static int Lsv_KlChain(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned u,
                        unsigned cu, unsigned c, const std::vector<std::pair<int, int>>& chain,
-                       int limit, std::vector<char>& cex) {
+                       int limit, std::vector<char>& cex, LsvKlConst& cache) {
   int N = Abc_NtkObjNumMax(ntk), nc = chain.size(), res = 1;
-  bool onePo = Abc_NtkPoNum(ntk) == 1;
   // Strash alone settles most cases when the chain gates the roots; when it
   // does not (many live cases), splitting only multiplies the work.
   std::vector<std::vector<int>> live;
@@ -650,16 +684,7 @@ static int Lsv_KlChain(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, un
         todo.swap(next);
       }
     for (auto& q : todo) {
-      int r = -2;
-      if (onePo) {
-        // Often both POs are the same constant here: check each side alone,
-        // much easier than the miter.
-        int v = -1;
-        for (int pol = 1; pol >= 0 && v < 0; --pol)
-          if (Lsv_KlSolve(ntk, order, cut, u, cu, c, q, 1, pol, limit, nullptr) == 1) v = !pol;
-        if (v >= 0 && Lsv_KlSolve(ntk, order, cut, u, cu, c, q, 2, !v, limit, nullptr) == 1) r = 1;
-      }
-      if (r == -2) r = Lsv_KlSolve(ntk, order, cut, u, cu, c, q, 0, 0, limit, &cex);
+      int r = Lsv_KlCase(ntk, order, cut, u, cu, c, q, limit, cex, cache);
       if (r == 0) return 0;
       if (r < 0) res = -1;
     }
@@ -1238,10 +1263,10 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
 
   // The PI literals that gate the roots, highest PI first (see Lsv_KlChain).
   std::map<int, int> lits;
-  for (unsigned r : cut.roots) {
-    std::map<int, int> cube;
-    if (Lsv_KlGateCube(ntk, order, r, tfo, cube)) lits.insert(cube.begin(), cube.end());
-  }
+  std::vector<std::map<int, int>> cubes(m);
+  for (int j = 0; j < m; ++j)
+    if (Lsv_KlGateCube(ntk, order, cut.roots[j], tfo, cubes[j])) lits.insert(cubes[j].begin(), cubes[j].end());
+    else cubes[j].clear();
   std::vector<std::pair<int, int>> chain(lits.rbegin(), lits.rend());
   std::vector<int> piIndex(orig.size(), -1);
   Abc_NtkForEachPi(ntk, obj, i) piIndex[Abc_ObjId(obj)] = i;
@@ -1359,21 +1384,71 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
       for (unsigned c = 0; c < (1u << m); ++c)
         if (c != orig_c[u] && !((observed[u] >> c) & 1)) tasks.push_back({u, orig_c[u], c});
     }
+    // The original PO's constant in the last chain cases (where most queries
+    // stay live), once per u for all c: computed in parallel, inherited by the
+    // query workers.
+    LsvKlConst oc;
+    if (!chain.empty() && Abc_NtkPoNum(ntk) == 1) {
+      std::map<unsigned, unsigned> us;  // u -> cu
+      for (const auto& t : tasks) us[t[0]] = t[1];
+      std::vector<std::pair<unsigned, std::vector<int>>> pre;
+      for (const auto& uc : us)
+        for (int i = (int)chain.size(); i >= (int)chain.size() - 1 && i >= 0; --i) {
+          std::vector<int> pc(orig.size(), -1);
+          for (int k = 0; k < i; ++k) pc[chain[k].first] = chain[k].second;
+          if (i < (int)chain.size()) pc[chain[i].first] = !chain[i].second;
+          pre.push_back({uc.first, pc});
+        }
+      std::vector<int> vs = Lsv_Pool(pre.size(), workers, [&](int k) {
+        LsvKlConst tmp;
+        return Lsv_KlOrigConst(ntk, order, cut, pre[k].first, us[pre[k].first], pre[k].second, 1000000, tmp) + 1;
+      });
+      // A lost worker (-1) leaves its entry out: computed again when needed.
+      for (size_t k = 0; k < pre.size(); ++k)
+        if (vs[k] >= 0) {
+          std::pair<unsigned, std::vector<int>> key{pre[k].first, {}};
+          for (size_t id = 0; id < pre[k].second.size(); ++id)
+            if (pre[k].second[id] >= 0) key.second.push_back(2 * id + pre[k].second[id]);
+          oc[key] = vs[k] - 1;
+        }
+    }
+    // Root j with gate cube G_j is unobservable where G_j fails, so there
+    // c acts like c2 = c with root j back at cu. Hence if c2 is allowed, only
+    // the single case G_j remains; and a counterexample of c2 found there is
+    // often one of c as well (checked by simulation).
+    std::function<int(unsigned, unsigned, unsigned, std::vector<char>&)> solve =
+        [&](unsigned u, unsigned cu, unsigned c, std::vector<char>& cex) {
+          LsvKlSat* sw = sweepFor(cu ^ c);
+          if (chain.empty()) return sw->Query(u, cu, c, cex, 2000);
+          int q = Lsv_KlChain(ntk, order, cut, u, cu, c, chain, 1000000, cex, oc);
+          if (q >= 0) return q;
+          for (int j = 0; j < m; ++j) {
+            unsigned bit = 1u << (m - 1 - j), c2 = c ^ bit;
+            if (!((cu ^ c) & bit) || cubes[j].empty()) continue;
+            std::vector<char> x;
+            int q2 = c2 == cu ? 1 : solve(u, cu, c2, x);
+            if (q2 == 1) {
+              std::vector<int> pc(orig.size(), -1);
+              for (const auto& kv : cubes[j]) pc[kv.first] = kv.second;
+              q = Lsv_KlCase(ntk, order, cut, u, cu, c, pc, 1000000, cex, oc);
+              if (q >= 0) return q;
+            } else if (q2 == 0 && !x.empty()) {
+              simNear(x, 1);
+              if ((observed[u] >> c) & 1) return 0;
+            }
+            break;
+          }
+          q = sw->Query(u, cu, c, cex, 200);
+          if (q < 0) q = sw->Query(u, cu, c, cex, 2000);
+          return q;
+        };
     // Queries are independent: spread them over the cores. A sweep over a copy
     // of most of the network rarely settles an allowed c but does find
     // counterexamples: try it with a bounded budget here; batched fraig and the
     // full sweep below take what is left.
     std::vector<int> qs = Lsv_Pool(tasks.size(), workers, [&](int i) {
       std::vector<char> cex;
-      unsigned u = tasks[i][0], cu = tasks[i][1], c = tasks[i][2];
-      LsvKlSat* sw = sweepFor(cu ^ c);
-      if (chain.empty()) return sw->Query(u, cu, c, cex, 2000);
-      // With gate literals: a short sweep, then the case split on them, then a
-      // longer sweep when the split does not help (Lsv_KlChain gives up).
-      int q = sw->Query(u, cu, c, cex, 200);
-      if (q < 0) q = Lsv_KlChain(ntk, order, cut, u, cu, c, chain, 1000000, cex);
-      if (q < 0) q = sw->Query(u, cu, c, cex, 2000);
-      return q;
+      return solve(tasks[i][0], tasks[i][1], tasks[i][2], cex);
     });
     for (size_t i = 0; i < tasks.size(); ++i) {
       if (qs[i] == 1) masks[tasks[i][0]] |= 1u << tasks[i][2];
