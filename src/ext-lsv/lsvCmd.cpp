@@ -3,23 +3,36 @@
 #include "base/main/mainInt.h"
 #include "sat/bsat/satSolver.h"
 #include "sat/cnf/cnf.h"
+#include "sat/cadical/cadicalSolver.h"
+#include "proof/fra/fra.h"
+#include "opt/dar/dar.h"
 
 #include <algorithm>
+#include <functional>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <random>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 extern "C" {
 Aig_Man_t* Abc_NtkToDar(Abc_Ntk_t* pNtk, int fExors, int fRegisters);
+int Aig_ManCountXors(Aig_Man_t* p);
 }
 
 static int Lsv_CommandPrintNodes(Abc_Frame_t* pAbc, int argc, char** argv);
@@ -451,14 +464,14 @@ struct LsvKlSearch {
 
 }  // namespace
 
-// c is in A(u) iff no X with U(X) = u makes a PO of N[V <- c] differ from N.
-// Under U = u the original roots equal cu, so both copies get constant roots,
-// and leaves outside the TFO of V become constants too; strash then folds most
-// of the miter away before SAT sees it.
-static bool Lsv_KlAllowed(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
-                          unsigned u, unsigned cu, unsigned c, std::vector<char>& cex) {
+// Adds to mt (whose PIs match ntk's) the miter output for (u, c): satisfiable
+// iff some X with U(X) = u makes a PO of N[V <- c] differ from N. pc (by object
+// id, -1 = free) fixes PIs. Mode 1 / 2 (single PO): satisfiable iff the PO of
+// N[V <- cu] / N[V <- c] can be pol under U = u.
+static Abc_Obj_t* Lsv_KlMiter(Abc_Ntk_t* mt, Abc_Ntk_t* ntk, Vec_Ptr_t* order,
+                              const LsvKlCut& cut, unsigned u, unsigned cu, unsigned c,
+                              const std::vector<int>* pc = nullptr, int mode = 0, int pol = 0) {
   int n = cut.leaves.size(), m = cut.roots.size();
-  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
   Abc_Aig_t* man = (Abc_Aig_t*)mt->pManFunc;
   size_t N = Abc_NtkObjNumMax(ntk);
   std::vector<Abc_Obj_t*> base(N), a(N), b(N);
@@ -469,15 +482,24 @@ static bool Lsv_KlAllowed(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
   base[constId] = a[constId] = b[constId] = one;
   Abc_Obj_t* obj;
   int i;
-  Abc_NtkForEachPi(ntk, obj, i) base[Abc_ObjId(obj)] = a[Abc_ObjId(obj)] = b[Abc_ObjId(obj)] =
-      Abc_NtkCreatePi(mt);
+  Abc_NtkForEachPi(ntk, obj, i) {
+    int v = pc ? (*pc)[Abc_ObjId(obj)] : -1;
+    base[Abc_ObjId(obj)] = a[Abc_ObjId(obj)] = b[Abc_ObjId(obj)] =
+        v < 0 ? Abc_NtkPi(mt, i) : Abc_ObjNotCond(one, !v);
+  }
   for (int j = 0; j < m; ++j) tfo[cut.roots[j]] = 1;
   auto fix = [&](unsigned id) {  // constants for roots and for leaves outside the TFO
     for (int j = 0; j < m; ++j)
       if (cut.roots[j] == id) { a[id] = bit(cu, m, j); b[id] = bit(c, m, j); return; }
     if (tfo[id]) return;
     for (int j = 0; j < n; ++j)
-      if (cut.leaves[j] == id) { a[id] = b[id] = bit(u, n, j); return; }
+      if (cut.leaves[j] == id) {
+        a[id] = b[id] = bit(u, n, j);
+        // A PI leaf is u's bit on every X the care set admits, so the original
+        // copy may fold it too; it then strashes together with a.
+        if (Abc_ObjIsPi(Abc_NtkObj(ntk, id))) base[id] = a[id];
+        return;
+      }
   };
   Abc_NtkForEachPi(ntk, obj, i) fix(Abc_ObjId(obj));
   Vec_PtrForEachEntry(Abc_Obj_t*, order, obj, i) {
@@ -492,12 +514,175 @@ static bool Lsv_KlAllowed(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
   Abc_Obj_t* diff = Abc_ObjNot(one);
   Abc_NtkForEachPo(ntk, obj, i) {
     unsigned d = Abc_ObjFaninId0(obj);
-    diff = Abc_AigOr(man, diff, Abc_AigXor(man, a[d], b[d]));
+    if (mode) diff = Abc_ObjNotCond((mode == 1 ? a : b)[d], Abc_ObjFaninC0(obj) ^ !pol);
+    else diff = Abc_AigOr(man, diff, Abc_AigXor(man, a[d], b[d]));
   }
   Abc_Obj_t* mu = diff;
   for (int j = 0; j < n; ++j)
     mu = Abc_AigAnd(man, mu, Abc_AigXor(man, base[cut.leaves[j]], Abc_ObjNot(bit(u, n, j))));
-  bool allowed = mu == Abc_ObjNot(one);
+  return mu;
+}
+
+// SAT on one Lsv_KlMiter output: 1 unsatisfiable, 0 satisfiable (cex set if
+// given), -1 gave up after limit conflicts (0: no limit; negative: strash only).
+static int Lsv_KlSolve(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned u,
+                       unsigned cu, unsigned c, const std::vector<int>& pc, int mode,
+                       int pol, int limit, std::vector<char>* cex) {
+  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
+  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
+  Abc_Obj_t* mu = Lsv_KlMiter(mt, ntk, order, cut, u, cu, c, &pc, mode, pol);
+  int r = 1;
+  if (mu != Abc_ObjNot(Abc_AigConst1(mt)) && limit < 0) r = -1;  // strash only
+  else if (mu != Abc_ObjNot(Abc_AigConst1(mt))) {
+    Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
+    Abc_AigCleanup((Abc_Aig_t*)mt->pManFunc);
+    Abc_NtkAddDummyPiNames(mt);
+    Abc_NtkAddDummyPoNames(mt);
+    Aig_Man_t* aig = Abc_NtkToDar(mt, 0, 0);
+    // As dsat: the output as a unit clause, faster than an assumption here.
+    r = Fra_FraigSat(aig, limit, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (r == 0 && cex && aig->pData)
+      for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) cex->push_back(((int*)aig->pData)[i] != 0);
+    ABC_FREE(aig->pData);
+    Aig_ManStop(aig);
+  }
+  Abc_NtkDelete(mt);
+  return r;
+}
+
+// PI literals every X must satisfy for a difference at root r to reach a PO:
+// the side inputs (outside tfoV) of r's post-dominators must be 1, and so must
+// the fanins of a required 1. False if r can never be observed.
+static bool Lsv_KlGateCube(Abc_Ntk_t* ntk, Vec_Ptr_t* order, unsigned r,
+                           const std::vector<char>& tfoV, std::map<int, int>& cube) {
+  int N = Abc_NtkObjNumMax(ntk), sink = N;  // sink: all POs
+  std::vector<char> t(N, 0);
+  std::vector<int> pos(N + 1, -1), ipd(N + 1, -1);
+  t[r] = 1;
+  Abc_Obj_t* o;
+  int i;
+  Vec_PtrForEachEntry(Abc_Obj_t*, order, o, i) {
+    pos[Abc_ObjId(o)] = i;
+    if (t[Abc_ObjFaninId0(o)] || t[Abc_ObjFaninId1(o)]) t[Abc_ObjId(o)] = 1;
+  }
+  pos[sink] = Vec_PtrSize(order);
+  auto meet = [&](int a, int b) {  // nearest common post-dominator
+    while (a != b) {
+      while (pos[a] < pos[b]) a = ipd[a];
+      while (pos[b] < pos[a]) b = ipd[b];
+    }
+    return a;
+  };
+  ipd[sink] = sink;
+  std::vector<int> nodes;  // TFO of r (a root: an AND node), topological
+  Vec_PtrForEachEntry(Abc_Obj_t*, order, o, i) if (t[Abc_ObjId(o)]) nodes.push_back(Abc_ObjId(o));
+  for (size_t k = nodes.size(); k-- > 0;) {
+    int v = nodes[k], d = -1;
+    Abc_Obj_t* fo;
+    int j;
+    Abc_ObjForEachFanout(Abc_NtkObj(ntk, v), fo, j) {
+      int f = Abc_ObjIsPo(fo) ? sink : (int)Abc_ObjId(fo);
+      if (ipd[f] < 0) continue;  // reaches no PO
+      d = d < 0 ? f : meet(d, f);
+    }
+    ipd[v] = d;
+  }
+  if (ipd[r] < 0) return false;
+  std::vector<std::pair<int, int>> st;  // (node, required value)
+  for (int d = ipd[r]; d != sink; d = ipd[d]) {
+    o = Abc_NtkObj(ntk, d);
+    if (!tfoV[Abc_ObjFaninId0(o)]) st.push_back({Abc_ObjFaninId0(o), !Abc_ObjFaninC0(o)});
+    if (!tfoV[Abc_ObjFaninId1(o)]) st.push_back({Abc_ObjFaninId1(o), !Abc_ObjFaninC1(o)});
+  }
+  std::map<int, int> req;
+  while (!st.empty()) {
+    auto [v, val] = st.back();
+    st.pop_back();
+    auto it = req.find(v);
+    if (it != req.end()) {
+      if (it->second != val) return false;
+      continue;
+    }
+    req[v] = val;
+    o = Abc_NtkObj(ntk, v);
+    if (Abc_ObjIsNode(o) && val) {
+      st.push_back({Abc_ObjFaninId0(o), !Abc_ObjFaninC0(o)});
+      st.push_back({Abc_ObjFaninId1(o), !Abc_ObjFaninC1(o)});
+    }
+  }
+  for (auto& p : req)
+    if (Abc_ObjIsPi(Abc_NtkObj(ntk, p.first))) cube[p.first] = p.second;
+  return true;
+}
+
+// Decides (u, c) by splitting the inputs along chain (PI literals that gate the
+// roots): case i has literals 0..i-1 true and literal i false, the last case all
+// true. Fixed PIs fold most cases to constant 0 in strash; in a divider the
+// difference only lives where the divisor is tiny. 1 / 0 / -1 as Lsv_KlAllowed.
+static int Lsv_KlChain(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned u,
+                       unsigned cu, unsigned c, const std::vector<std::pair<int, int>>& chain,
+                       int limit, std::vector<char>& cex) {
+  int N = Abc_NtkObjNumMax(ntk), nc = chain.size(), res = 1;
+  bool onePo = Abc_NtkPoNum(ntk) == 1;
+  // Strash alone settles most cases when the chain gates the roots; when it
+  // does not (many live cases), splitting only multiplies the work.
+  std::vector<std::vector<int>> live;
+  for (int i = nc; i >= 0; --i) {
+    std::vector<int> pc(N, -1);
+    for (int k = 0; k < i; ++k) pc[chain[k].first] = chain[k].second;
+    if (i < nc) pc[chain[i].first] = !chain[i].second;
+    if (Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 0, 0, -1, nullptr) == 1) continue;
+    if (live.size() == 4) return -1;
+    pc.push_back(i);
+    live.push_back(pc);
+  }
+  for (auto& pc : live) {
+    int i = pc.back();
+    pc.pop_back();
+    // A few free chain PIs left: enumerate them, smaller miters.
+    std::vector<std::vector<int>> todo{pc};
+    int nFree = nc - 1 - i;
+    if (nFree > 0 && nFree <= 3)
+      for (int k = i + 1; k < nc; ++k) {
+        std::vector<std::vector<int>> next;
+        for (auto& q : todo)
+          for (int b = 0; b < 2; ++b) next.push_back(q), next.back()[chain[k].first] = b;
+        todo.swap(next);
+      }
+    for (auto& q : todo) {
+      int r = -2;
+      if (onePo) {
+        // Often both POs are the same constant here: check each side alone,
+        // much easier than the miter.
+        int v = -1;
+        for (int pol = 1; pol >= 0 && v < 0; --pol)
+          if (Lsv_KlSolve(ntk, order, cut, u, cu, c, q, 1, pol, limit, nullptr) == 1) v = !pol;
+        if (v >= 0 && Lsv_KlSolve(ntk, order, cut, u, cu, c, q, 2, !v, limit, nullptr) == 1) r = 1;
+      }
+      if (r == -2) r = Lsv_KlSolve(ntk, order, cut, u, cu, c, q, 0, 0, limit, &cex);
+      if (r == 0) return 0;
+      if (r < 0) res = -1;
+    }
+  }
+  return res;
+}
+
+// c is in A(u) iff no X with U(X) = u makes a PO of N[V <- c] differ from N.
+// Under U = u the original roots equal cu, so both copies get constant roots,
+// and leaves outside the TFO of V become constants too; strash then folds most
+// of the miter away before SAT sees it.
+// Returns 1 (allowed), 0 (not) or -1 (gave up; only with a positive limit on
+// the conflicts of fraig's final SAT call). A negative limit means plain SAT
+// without fraig.
+static int Lsv_KlAllowed(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
+                         unsigned u, unsigned cu, unsigned c, std::vector<char>& cex,
+                         int limit) {
+  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
+  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
+  Abc_Aig_t* man = (Abc_Aig_t*)mt->pManFunc;
+  Abc_Obj_t* one = Abc_AigConst1(mt);
+  Abc_Obj_t* mu = Lsv_KlMiter(mt, ntk, order, cut, u, cu, c);
+  int allowed = mu == Abc_ObjNot(one);
   if (!allowed) {
     Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
     Abc_AigCleanup(man);
@@ -507,11 +692,24 @@ static bool Lsv_KlAllowed(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
     // Plain SAT settles most calls; the rest go to fraig-based CEC, whose SAT
     // sweeping merges the equal parts of the two copies.
     Cnf_Dat_t* cnf = Cnf_Derive(aig, 1);
+    if (limit == -2) {  // CaDiCaL, unbounded
+      cadical_solver* cs = cadical_solver_new();
+      cadical_solver_setnvars(cs, cnf->nVars);
+      int *beg, *end, k, unsat = 0;
+      Cnf_CnfForClause(cnf, beg, end, k) if (!unsat && !cadical_solver_addclause(cs, beg, end)) unsat = 1;
+      int l = Abc_Var2Lit(cnf->pVarNums[Aig_ManCo(aig, 0)->Id], 0);
+      int rr = unsat ? -1 : cadical_solver_solve(cs, &l, &l + 1, 0, 0, 0, 0);
+      cadical_solver_delete(cs);
+      Cnf_DataFree(cnf);
+      Aig_ManStop(aig);
+      Abc_NtkDelete(mt);
+      return rr == 1 ? 0 : rr == -1 ? 1 : -1;
+    }
     sat_solver* sat = (sat_solver*)Cnf_DataWriteIntoSolver(cnf, 1, 0);
     int r = l_False;
     if (sat) {
       lit l = Abc_Var2Lit(cnf->pVarNums[Aig_ManCo(aig, 0)->Id], 0);
-      r = sat_solver_solve(sat, &l, &l + 1, 1000, 0, 0, 0);
+      r = sat_solver_solve(sat, &l, &l + 1, limit < 0 ? 0 : 1000, 0, 0, 0);
       Aig_Obj_t* ci;
       int k;
       if (r == l_True) Aig_ManForEachCi(aig, ci, k) {
@@ -521,8 +719,22 @@ static bool Lsv_KlAllowed(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
       sat_solver_delete(sat);
     }
     Cnf_DataFree(cnf);
-    if (r == l_Undef) r = Fra_FraigCec(&aig, 1000000000, 0) == 1 ? l_False : l_True;
-    allowed = r == l_False;
+    if (r == l_Undef) {
+      int cec = Fra_FraigCec(&aig, limit ? limit : 1000000000, 0);
+      r = cec == 1 ? l_False : cec == 0 ? l_True : l_Undef;
+    }
+    if (r == l_Undef && !limit) {  // fraig gave up: settle it with an unlimited SAT call
+      Cnf_Dat_t* cnf2 = Cnf_Derive(aig, 1);
+      sat_solver* sat2 = (sat_solver*)Cnf_DataWriteIntoSolver(cnf2, 1, 0);
+      r = l_False;
+      if (sat2) {
+        lit l = Abc_Var2Lit(cnf2->pVarNums[Aig_ManCo(aig, 0)->Id], 0);
+        r = sat_solver_solve(sat2, &l, &l + 1, 0, 0, 0, 0);
+        sat_solver_delete(sat2);
+      }
+      Cnf_DataFree(cnf2);
+    }
+    allowed = r == l_False ? 1 : r == l_True ? 0 : -1;
     Aig_ManStop(aig);
   }
   Abc_NtkDelete(mt);
@@ -545,7 +757,7 @@ struct LsvKlSat {
   int N, mu, nVars;
   std::vector<char> tfo, isRoot;
   std::vector<int> pos, xors;
-  int limit1, limit2, limit3, maxUndef;
+  int limit1 = 100;  // conflicts for the PO-differs call
   unsigned polU = ~0u;
   std::vector<char> seenDiff, witness;
   std::vector<uint64_t> wO, wF;
@@ -553,13 +765,16 @@ struct LsvKlSat {
 
   int F(int id) const { return tfo[id] ? N + id : id; }
 
-  LsvKlSat(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut)
+  // Only the TFO of the roots in flip (bit j = root j, MSB first) is copied:
+  // other roots keep their original value under U = u, so their TFO is shared.
+  LsvKlSat(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned flip)
       : ntk(ntk), order(order), cut(cut), N(Abc_NtkObjNumMax(ntk)) {
-    // Conflict limits: PO-differs call, one node pair, one PO driver; and how many
-    // unsettled pairs to tolerate before falling back to Lsv_KlAllowed.
-    limit1 = 100, limit2 = 1000, limit3 = 20000, maxUndef = 10;
     tfo.assign(N, 0), isRoot.assign(N, 0), pos.assign(N, -1);
-    for (unsigned r : cut.roots) tfo[r] = isRoot[r] = 1;
+    int m = cut.roots.size();
+    for (int j = 0; j < m; ++j) {
+      isRoot[cut.roots[j]] = 1;
+      if ((flip >> (m - 1 - j)) & 1) tfo[cut.roots[j]] = 1;
+    }
     s = sat_solver_new();
     mu = 2 * N;
     nVars = mu + 1 + Abc_NtkPoNum(ntk);
@@ -572,7 +787,9 @@ struct LsvKlSat {
       int c0 = Abc_ObjFaninC0(obj), c1 = Abc_ObjFaninC1(obj);
       pos[id] = i;
       sat_solver_add_and(s, id, f0, f1, c0, c1, 0);
-      if (isRoot[id] || !(tfo[f0] || tfo[f1])) continue;
+      // An unflipped root is forced to cu, its original value under U = u, so
+      // the difference stops there.
+      if (tfo[id] || isRoot[id] || !(tfo[f0] || tfo[f1])) continue;
       tfo[id] = 1;
       sat_solver_add_and(s, N + id, F(f0), F(f1), c0, c1, 0);
     }
@@ -585,6 +802,8 @@ struct LsvKlSat {
       clause.push_back(Abc_Var2Lit(mu + 1 + i, 0));
     }
     sat_solver_addclause(s, clause.data(), clause.data() + clause.size());
+    sat_solver_simplify(s);
+    sat_solver_bookmark(s);
   }
   ~LsvKlSat() { sat_solver_delete(s); }
 
@@ -640,7 +859,8 @@ struct LsvKlSat {
   }
 
   // 1: c is in A(u), 0: it is not, -1: gave up. u must be producible and cu its root value.
-  int Query(unsigned u, unsigned cu, unsigned c, std::vector<char>& cex) {
+  // maxLim: the largest per-pair conflict budget to escalate to (0: unbounded).
+  int Query(unsigned u, unsigned cu, unsigned c, std::vector<char>& cex, int maxLim) {
     int n = cut.leaves.size(), m = cut.roots.size();
     std::vector<lit> a;
     for (int j = 0; j < n; ++j) a.push_back(Abc_Var2Lit(cut.leaves[j], !((u >> (n - 1 - j)) & 1)));
@@ -665,7 +885,6 @@ struct LsvKlSat {
     a.push_back(Abc_Var2Lit(mu, 0));
     int r = Solve(a, limit1);
     a.pop_back();
-    int nUndef = 0;
     if (r == l_True) Model(cex);
     if (r != l_Undef) return r == l_False;
 
@@ -683,55 +902,294 @@ struct LsvKlSat {
       }
       return po;
     };
+    auto equal = [&](int id) {  // adds original == copy under act
+      lit c1[3] = {Abc_Var2Lit(act, 1), Abc_Var2Lit(id, 1), Abc_Var2Lit(N + id, 0)};
+      lit c2[3] = {Abc_Var2Lit(act, 1), Abc_Var2Lit(id, 0), Abc_Var2Lit(N + id, 1)};
+      sat_solver_addclause(s, c1, c1 + 3);
+      sat_solver_addclause(s, c2, c2 + 3);
+    };
     int result = 1;
     seenDiff.assign(N, 0);
     wO.resize(N), wF.resize(N);
-    std::vector<char> x;
+    std::vector<char> x, proved(N, 0);
     if (!witness.empty() && Simulate(witness, u, c, cex)) result = 0;
     for (int j = 0; j < m && result == 1; ++j)
       if ((((cu ^ c) >> (m - 1 - j)) & 1) && spread(Abc_NtkObj(ntk, cut.roots[j]))) result = 0;
-    while (result == 1 && !work.empty()) {
-      int p = *work.begin();
-      work.erase(work.begin());
-      Abc_Obj_t* obj = (Abc_Obj_t*)Vec_PtrEntry(order, p);
-      int id = Abc_ObjId(obj);
-      if (isRoot[id]) continue;
-      int res = seenDiff[id] ? l_True : l_False;
-      // A PO driver must be settled; other nodes may stay unproved.
-      bool po = false;
-      Abc_Obj_t* fo;
-      int i;
-      Abc_ObjForEachFanout(obj, fo, i) po = po || Abc_ObjIsPo(fo);
-      for (int pol = 0; pol < 2 && res != l_True; ++pol) {
-        a.push_back(Abc_Var2Lit(id, pol));
-        a.push_back(Abc_Var2Lit(N + id, !pol));
-        r = Solve(a, po ? limit3 : limit2);
-        a.pop_back(), a.pop_back();
-        if (r != l_False) res = r;
-        if (r != l_True) continue;
-        // The model and its neighbours show which later nodes differ: no SAT call for those.
-        Model(x);
-        if (Simulate(x, u, c, cex)) result = 0;
+    // Rounds with a growing conflict budget. A pair the budget does not settle
+    // is only skipped: its fanouts stay in the worklist, and often the
+    // difference dies out further up anyway (e.g. absorbed by a fixed leaf).
+    // Only an unsettled PO driver calls for another round; proved pairs keep
+    // their clauses, so later rounds go straight to the hard part.
+    const std::set<int> start = work;
+    for (int lim = 20; result == 1; lim *= 10) {
+      int L = !maxLim && lim > 20000 ? 0 : lim;  // 0: unbounded
+      bool open = false;
+      int nUnd = 0;
+      work = start;
+      int done = 0;  // positions below it are settled
+      while (result == 1 && !work.empty()) {
+        int p = *work.begin();
+        work.erase(work.begin());
+        // Copied nodes that never entered the worklist have only equal fanins, so
+        // they are equal too; the solver has separate variables and must be told.
+        for (; done < p; ++done) {
+          int e = Abc_ObjId((Abc_Obj_t*)Vec_PtrEntry(order, done));
+          if (tfo[e] && !isRoot[e] && !proved[e]) proved[e] = 1, equal(e);
+        }
+        done = p + 1;
+        Abc_Obj_t* obj = (Abc_Obj_t*)Vec_PtrEntry(order, p);
+        int id = Abc_ObjId(obj);
+        if (isRoot[id] || proved[id]) continue;
+        int res = seenDiff[id] ? l_True : l_False;
+        bool po = false;
+        Abc_Obj_t* fo;
+        int i;
+        Abc_ObjForEachFanout(obj, fo, i) po = po || Abc_ObjIsPo(fo);
+        for (int pol = 0; pol < 2 && res != l_True; ++pol) {
+          a.push_back(Abc_Var2Lit(id, pol));
+          a.push_back(Abc_Var2Lit(N + id, !pol));
+          int r = Solve(a, po && L ? 20 * L : L);
+          nUnd += r == l_Undef;
+          a.pop_back(), a.pop_back();
+          if (r != l_False) res = r;
+          if (r != l_True) continue;
+          // The model and its neighbours show which later nodes differ: no SAT call for those.
+          Model(x);
+          if (Simulate(x, u, c, cex)) result = 0;
+        }
+        if (res == l_False) {
+          proved[id] = 1;
+          equal(id);
+          continue;
+        }
+        if (spread(obj) && result == 1) open = true;  // an unsettled PO driver
+        // Undecided pairs make their whole TFO undecided too: past a few, the
+        // budget is just too small, so go to the next round right away.
+        if (L && nUnd > 100) {
+          open = true;
+          break;
+        }
       }
-      if (res == l_False) {
-        lit c1[3] = {Abc_Var2Lit(act, 1), Abc_Var2Lit(id, 1), Abc_Var2Lit(N + id, 0)};
-        lit c2[3] = {Abc_Var2Lit(act, 1), Abc_Var2Lit(id, 0), Abc_Var2Lit(N + id, 1)};
-        sat_solver_addclause(s, c1, c1 + 3);
-        sat_solver_addclause(s, c2, c2 + 3);
-        continue;
+      if (result == 1 && open) {
+        if (!L || (maxLim && lim >= maxLim)) result = -1;
+      } else {
+        break;
       }
-      if (res == l_Undef && ++nUndef > maxUndef) result = -1;
-      if (spread(obj) && result == 1) result = -1;  // an unproved PO driver without a model
     }
-    lit off = Abc_Var2Lit(act, 1);
-    sat_solver_addclause(s, &off, &off + 1);
+    // Drop this query's clauses (and learnt ones): kept, the guarded clauses of
+    // hundreds of queries would bog the solver down.
+    sat_solver_rollback(s);
+    nVars = act;
     return result;
   }
 };
 
+// Fraigs the miters of several (u, c) in one AIG, so the logic they share (most
+// of it, for the same PI leaf values) is swept once: the first rounds of
+// Fra_FraigCec's loop, without its prove mode. Returns 1 for each output proved
+// 0 and -1 for the rest.
+static std::vector<int> Lsv_KlBatch(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
+                                    const std::vector<std::array<unsigned, 3>>& items) {
+  std::vector<int> res(items.size(), -1);
+  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
+  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
+  Abc_Obj_t* zero = Abc_ObjNot(Abc_AigConst1(mt));
+  bool open = false;
+  for (const auto& it : items) {
+    Abc_Obj_t* mu = Lsv_KlMiter(mt, ntk, order, cut, it[0], it[1], it[2]);
+    open = open || mu != zero;
+    Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
+  }
+  if (open) {
+    Abc_AigCleanup((Abc_Aig_t*)mt->pManFunc);
+    Abc_NtkAddDummyPiNames(mt);
+    Abc_NtkAddDummyPoNames(mt);
+    Aig_Man_t* aig = Abc_NtkToDar(mt, 0, 0);
+    Aig_Man_t* t = aig;
+    aig = Dar_ManRwsat(t, 1, 0);
+    Aig_ManStop(t);
+    Fra_Par_t pars;
+    Fra_ParamsDefault(&pars);
+    pars.nBTLimitNode = 2;
+    pars.nBTLimitMiter = 300;
+    pars.fDontShowBar = 1;
+    for (int round = 0; round < 4; ++round) {
+      if (Aig_ManCountXors(aig) * 30 > Aig_ManNodeNum(aig) + 300) {
+        t = aig;
+        aig = Dar_ManBalanceXor(t, 1, 0, 0);
+        Aig_ManStop(t);
+      }
+      t = aig;
+      aig = Fra_FraigPerform(t, &pars);
+      Aig_ManStop(t);
+      t = aig;
+      aig = Dar_ManRewriteDefault(t);
+      Aig_ManStop(t);
+      bool done = true;
+      for (size_t k = 0; k < items.size(); ++k) {
+        Aig_Obj_t* co = Aig_ManCo(aig, k);
+        res[k] = Aig_ObjFanin0(co) == Aig_ManConst1(aig) && Aig_ObjFaninC0(co) ? 1 : -1;
+        done = done && res[k] == 1;
+      }
+      if (done) break;
+      pars.nBTLimitNode *= 8;
+      pars.nBTLimitMiter *= 2;
+    }
+    Aig_ManStop(aig);
+  } else {
+    std::fill(res.begin(), res.end(), 1);
+  }
+  Abc_NtkDelete(mt);
+  return res;
+}
+
+// Runs f in a forked child and returns its result, or n times -1 if it takes
+// longer than ms: ABC's fraiging cannot be stopped from inside. Without fork,
+// f just runs here.
+static std::vector<int> Lsv_Timed(const std::function<std::vector<int>()>& f, size_t n, int ms) {
+  int fd[2];
+  if (pipe(fd) != 0) return f();
+  fflush(stdout);
+  fflush(stderr);
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fd[0]);
+    close(fd[1]);
+    return f();
+  }
+  if (pid == 0) {
+    close(fd[0]);
+    std::vector<int> r = f();
+    const char* p = (const char*)r.data();
+    size_t left = r.size() * sizeof(int);
+    while (left) {
+      ssize_t w = write(fd[1], p, left);
+      if (w <= 0) break;
+      p += w, left -= w;
+    }
+    _exit(0);
+  }
+  close(fd[1]);
+  std::vector<int> res(n, -1), buf(n);
+  size_t want = n * sizeof(int), got = 0;
+  abctime end = Abc_Clock() + (abctime)ms * CLOCKS_PER_SEC / 1000;
+  while (got < want) {
+    // Abc_Clock is CPU time of this process, which waits; use poll's timeout.
+    struct pollfd pfd = {fd[0], POLLIN, 0};
+    int r = poll(&pfd, 1, ms);
+    if (r <= 0) break;
+    ssize_t k = read(fd[0], (char*)buf.data() + got, want - got);
+    if (k <= 0) break;
+    got += k;
+  }
+  (void)end;
+  if (got == want) res = buf;
+  else kill(pid, SIGKILL);
+  close(fd[0]);
+  waitpid(pid, nullptr, 0);
+  return res;
+}
+
+// Runs each f in its own forked child and returns the first answer; the
+// others are killed. Every f is exact, so whichever finishes first is right.
+// Without fork, the first f just runs here.
+static int Lsv_Race(const std::vector<std::function<int()>>& fs) {
+  fflush(stdout);
+  fflush(stderr);
+  std::vector<pid_t> pids;
+  std::vector<struct pollfd> pfds;
+  for (const auto& f : fs) {
+    int fd[2];
+    if (pipe(fd) != 0) break;
+    pid_t pid = fork();
+    if (pid < 0) {
+      close(fd[0]);
+      close(fd[1]);
+      break;
+    }
+    if (pid == 0) {
+      close(fd[0]);
+      int r = f();
+      if (write(fd[1], &r, sizeof r) < 0) {}
+      _exit(0);
+    }
+    close(fd[1]);
+    pids.push_back(pid);
+    pfds.push_back({fd[0], POLLIN, 0});
+  }
+  int res = -1;
+  if (pids.empty()) return fs[0]();
+  size_t open = pfds.size();
+  while (res < 0 && open) {
+    if (poll(pfds.data(), pfds.size(), -1) < 0) break;
+    for (auto& p : pfds) {
+      if (p.fd < 0 || !p.revents) continue;
+      int r;
+      if (read(p.fd, &r, sizeof r) == (ssize_t)sizeof r && r >= 0) res = r;
+      close(p.fd);
+      p.fd = -1;
+      --open;
+      if (res >= 0) break;
+    }
+  }
+  for (size_t i = 0; i < pids.size(); ++i) {
+    kill(pids[i], SIGKILL);
+    waitpid(pids[i], nullptr, 0);
+    if (pfds[i].fd >= 0) close(pfds[i].fd);
+  }
+  return res;
+}
+
+// Runs f(0..n-1) on up to `workers` forked children, which take the next task
+// from a pipe as they finish one. A task whose child dies stays -1.
+static std::vector<int> Lsv_Pool(size_t n, size_t workers, const std::function<int(int)>& f) {
+  std::vector<int> res(n, -1);
+  int q[2], r[2];
+  if (workers < 2 || n < 2 || pipe(q) != 0) {
+    for (size_t i = 0; i < n; ++i) res[i] = f(i);
+    return res;
+  }
+  if (pipe(r) != 0) {
+    close(q[0]), close(q[1]);
+    for (size_t i = 0; i < n; ++i) res[i] = f(i);
+    return res;
+  }
+  for (int i = 0; i < (int)n; ++i)  // n is small: fits the pipe buffer
+    if (write(q[1], &i, sizeof i) < 0) {}
+  close(q[1]);
+  fflush(stdout);
+  fflush(stderr);
+  std::vector<pid_t> pids;
+  for (size_t w = 0; w < std::min(workers, n); ++w) {
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(r[0]);
+      int i;
+      while (read(q[0], &i, sizeof i) == (ssize_t)sizeof i) {
+        int out[2] = {i, f(i)};
+        if (write(r[1], out, sizeof out) < 0) break;
+      }
+      _exit(0);
+    }
+    if (pid > 0) pids.push_back(pid);
+  }
+  close(q[0]);
+  close(r[1]);
+  if (pids.empty()) {  // no fork: the queue is lost, do it here
+    close(r[0]);
+    for (size_t i = 0; i < n; ++i) res[i] = f(i);
+    return res;
+  }
+  int out[2];
+  while (read(r[0], out, sizeof out) == (ssize_t)sizeof out) res[out[0]] = out[1];
+  close(r[0]);
+  for (pid_t pid : pids) waitpid(pid, nullptr, 0);
+  return res;
+}
+
 // Returns A(u) as a bit mask over root values c, for every leaf value u.
 static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
-                                        const LsvKlCut& cut) {
+                                        const LsvKlCut& cut, size_t workers) {
   int n = cut.leaves.size(), m = cut.roots.size();
   unsigned full = (1u << (1 << m)) - 1;
   std::vector<unsigned> masks(1u << n, full);
@@ -778,6 +1236,16 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
   Aig_Man_t* aig = Abc_NtkToDar(miter, 0, 0);
   int nPis = Abc_NtkPiNum(ntk);
 
+  // The PI literals that gate the roots, highest PI first (see Lsv_KlChain).
+  std::map<int, int> lits;
+  for (unsigned r : cut.roots) {
+    std::map<int, int> cube;
+    if (Lsv_KlGateCube(ntk, order, r, tfo, cube)) lits.insert(cube.begin(), cube.end());
+  }
+  std::vector<std::pair<int, int>> chain(lits.rbegin(), lits.rend());
+  std::vector<int> piIndex(orig.size(), -1);
+  Abc_NtkForEachPi(ntk, obj, i) piIndex[Abc_ObjId(obj)] = i;
+
   // Random simulation finds most produced u, their root values, and most c
   // that a PO can observe; SAT is only asked about the rest.
   std::vector<char> seen(masks.size());
@@ -816,14 +1284,35 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
       }
     }
   };
-  for (int word = 0; word < 64; ++word) {
-    for (int i = 0; i < nPis; ++i) val[Aig_ManCi(aig, i)->Id] = rng();
+  // Uniform, sparse and dense words: arithmetic circuits hide many differences
+  // behind operands with long runs of 0s or 1s.
+  for (int word = 0; word < 256; ++word) {
+    for (int i = 0; i < nPis; ++i) {
+      uint64_t r = rng();
+      if (word % 4 == 1) r &= rng() & rng();
+      if (word % 4 == 2) r |= rng() | rng();
+      if (word % 4 == 3) r &= rng() & rng() & rng() & rng();
+      val[Aig_ManCi(aig, i)->Id] = r;
+    }
+    simWord();
+  }
+  // Differences at the roots only show where their gate literals hold (e.g. a
+  // tiny divisor): random patterns with all but the last few of them true.
+  for (int word = 0; !chain.empty() && word < 128; ++word) {
+    for (int i = 0; i < nPis; ++i) {
+      uint64_t r = rng();
+      if (word % 3 == 1) r &= rng() & rng();
+      if (word % 3 == 2) r |= rng() | rng();
+      val[Aig_ManCi(aig, i)->Id] = r;
+    }
+    for (int k = 0; k + word % 9 < (int)chain.size(); ++k)
+      val[Aig_ManCi(aig, piIndex[chain[k].first])->Id] = chain[k].second ? ~uint64_t(0) : 0;
     simWord();
   }
   // Random patterns rarely observe V in deep arithmetic. A SAT counterexample
   // does, and so do many of its neighbours, often for other u and c as well.
-  auto simNear = [&](const std::vector<char>& x) {
-    for (int word = 0; word < 4; ++word) {
+  auto simNear = [&](const std::vector<char>& x, int words) {
+    for (int word = 0; word < words; ++word) {
       std::vector<uint64_t> w(nPis);
       for (int i = 0; i < nPis; ++i) w[i] = x[i] ? ~uint64_t(0) : 0;
       for (int bit = 1; bit < 64; ++bit)
@@ -833,7 +1322,14 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
     }
   };
 
-  LsvKlSat sweep(ntk, order, cut);
+  std::map<unsigned, std::unique_ptr<LsvKlSat>> sweeps;  // by flipped roots, built lazily
+  auto sweepFor = [&](unsigned fm) {
+    std::unique_ptr<LsvKlSat>& sw = sweeps[fm];
+    if (!sw) sw.reset(new LsvKlSat(ntk, order, cut, fm));
+    return sw.get();
+  };
+  std::vector<std::array<unsigned, 3>> tasks;             // (u, cu, c) for the sweep
+  std::vector<std::array<unsigned, 3>> pending;           // (u, cu, c) left for batching
   Cnf_Dat_t* cnf = Cnf_Derive(aig, Aig_ManCoNum(aig));
   sat_solver* sat = (sat_solver*)Cnf_DataWriteIntoSolver(cnf, 1, 0);
   if (sat) {
@@ -841,23 +1337,89 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
     std::vector<lit> lits(n);
     for (unsigned u = 0; u < masks.size(); ++u) {
       for (int j = 0; j < n; ++j) lits[j] = Abc_Var2Lit(coVar(j), !((u >> (n - 1 - j)) & 1));
+      int pt = l_Undef;  // a point with U = u in the solver's model
       if (!seen[u]) {
-        if (sat_solver_solve(sat, lits.data(), lits.data() + n, 0, 0, 0, 0) == l_False)
-          continue;  // u is never produced: everything is allowed
+        pt = sat_solver_solve(sat, lits.data(), lits.data() + n, 0, 0, 0, 0);
+        if (pt == l_False) continue;  // u is never produced: everything is allowed
         orig_c[u] = 0;
         for (int j = 0; j < m; ++j)
           orig_c[u] = orig_c[u] << 1 | sat_solver_var_value(sat, coVar(n + 1 + j));
+      } else if (observed[u] != full) {
+        pt = sat_solver_solve(sat, lits.data(), lits.data() + n, 10000, 0, 0, 0);
       }
-      unsigned mask = 1u << orig_c[u];  // the original root values are always fine
-      for (unsigned c = 0; c < (1u << m); ++c) {
-        if (c == orig_c[u] || ((observed[u] >> c) & 1)) continue;
+      if (pt == l_True) {  // patterns near it mostly keep U = u: more chances to observe c
+        std::vector<char> x(nPis);
+        for (int i = 0; i < nPis; ++i) {
+          int v = cnf->pVarNums[Aig_ManCi(aig, i)->Id];
+          x[i] = v >= 0 && sat_solver_var_value(sat, v);
+        }
+        simNear(x, 16);
+      }
+      masks[u] = 1u << orig_c[u];  // the original root values are always fine
+      for (unsigned c = 0; c < (1u << m); ++c)
+        if (c != orig_c[u] && !((observed[u] >> c) & 1)) tasks.push_back({u, orig_c[u], c});
+    }
+    // Queries are independent: spread them over the cores. A sweep over a copy
+    // of most of the network rarely settles an allowed c but does find
+    // counterexamples: try it with a bounded budget here; batched fraig and the
+    // full sweep below take what is left.
+    std::vector<int> qs = Lsv_Pool(tasks.size(), workers, [&](int i) {
+      std::vector<char> cex;
+      unsigned u = tasks[i][0], cu = tasks[i][1], c = tasks[i][2];
+      LsvKlSat* sw = sweepFor(cu ^ c);
+      if (chain.empty()) return sw->Query(u, cu, c, cex, 2000);
+      // With gate literals: a short sweep, then the case split on them, then a
+      // longer sweep when the split does not help (Lsv_KlChain gives up).
+      int q = sw->Query(u, cu, c, cex, 200);
+      if (q < 0) q = Lsv_KlChain(ntk, order, cut, u, cu, c, chain, 1000000, cex);
+      if (q < 0) q = sw->Query(u, cu, c, cex, 2000);
+      return q;
+    });
+    for (size_t i = 0; i < tasks.size(); ++i) {
+      if (qs[i] == 1) masks[tasks[i][0]] |= 1u << tasks[i][2];
+      if (qs[i] < 0) pending.push_back(tasks[i]);
+    }
+    // Batch what is left by the values of the PI leaves, which the miters fold.
+    unsigned piLeaves = 0;
+    for (int j = 0; j < n; ++j)
+      if (Abc_ObjIsPi(Abc_NtkObj(ntk, cut.leaves[j]))) piLeaves |= 1u << (n - 1 - j);
+    std::map<unsigned, std::vector<std::array<unsigned, 3>>> groups;
+    for (const auto& it : pending) groups[it[0] & piLeaves].push_back(it);
+    for (auto& g : groups) {
+      std::vector<std::array<unsigned, 3>> items;
+      for (const auto& it : g.second)
+        if (!((observed[it[0]] >> it[2]) & 1)) items.push_back(it);
+      std::vector<int> res = Lsv_Timed([&] { return Lsv_KlBatch(ntk, order, cut, items); },
+                                       items.size(), 5000);
+      for (size_t k = 0; k < items.size(); ++k) {
+        unsigned u = items[k][0], cu = items[k][1], c = items[k][2];
+        if ((observed[u] >> c) & 1) continue;  // a later counterexample showed it
+        int q = res[k];
         std::vector<char> cex;
-        int q = sweep.Query(u, orig_c[u], c, cex);
-        bool ok = q < 0 ? Lsv_KlAllowed(ntk, order, cut, u, orig_c[u], c, cex) : q;
-        if (!cex.empty()) simNear(cex);
-        if (ok) mask |= 1u << c;
+        LsvKlSat* sw = sweepFor(cu ^ c);
+        if (q < 0) q = sw->Query(u, cu, c, cex, 20000);
+        // Each engine stalls on some of what is left, rarely all on the same
+        // query: race them.
+        if (q < 0)
+          q = Lsv_Race({[&] {
+                          std::vector<char> x;
+                          return Lsv_KlAllowed(ntk, order, cut, u, cu, c, x, 0);
+                        },
+                        [&] {
+                          std::vector<char> x;
+                          return Lsv_KlAllowed(ntk, order, cut, u, cu, c, x, -1);
+                        },
+                        [&] {
+                          std::vector<char> x;
+                          return Lsv_KlAllowed(ntk, order, cut, u, cu, c, x, -2);
+                        },
+                        [&] {
+                          std::vector<char> x;
+                          return sw->Query(u, cu, c, x, 0);
+                        }});
+        if (!cex.empty()) simNear(cex, 4);
+        if (q == 1) masks[u] |= 1u << c;
       }
-      masks[u] = mask;
     }
     sat_solver_delete(sat);
   }
@@ -964,10 +1526,80 @@ static int Lsv_CommandKlFlex(Abc_Frame_t* frame, int argc, char** argv) {
   s.Search(0, 0);
 
   Vec_Ptr_t* order = Abc_NtkDfs(ntk, 1);
-  for (const LsvKlCut& cut : s.results) {
-    std::vector<unsigned> masks = Lsv_KlFlex(ntk, order, cut);
-    std::vector<unsigned> roots = cut.roots;
-    Lsv_KlPrint(cut, masks, roots, 0, s.l);
+  // Cuts are independent: compute them in forked children, up to one per core,
+  // and print in the original order.
+  std::vector<std::vector<unsigned>> all(s.results.size());
+  std::vector<char> have(s.results.size());
+  long cores = sysconf(_SC_NPROCESSORS_ONLN);
+  size_t workers = cores > 1 ? (size_t)cores : 1;
+  // Each cut also spreads its own queries over the cores, oversubscribed up to
+  // 4x in total: the OS shares them, so cores freed by finished cuts go to the
+  // slow ones.
+  size_t perCut = std::min(workers, std::max<size_t>(1, 4 * workers / std::max<size_t>(1, std::min(workers, s.results.size()))));
+  struct Job { pid_t pid; int fd; size_t cut; std::string buf; };
+  std::vector<Job> jobs;
+  size_t next = 0;
+  auto finish = [&](Job& j) {
+    size_t want = sizeof(unsigned) << s.results[j.cut].leaves.size();
+    if (j.buf.size() == want) {
+      all[j.cut].resize(want / sizeof(unsigned));
+      memcpy(all[j.cut].data(), j.buf.data(), want);
+      have[j.cut] = 1;
+    }
+    close(j.fd);
+    waitpid(j.pid, nullptr, 0);
+  };
+  while (next < s.results.size() || !jobs.empty()) {
+    while (next < s.results.size() && jobs.size() < workers) {
+      size_t i = next++;
+      int fd[2];
+      pid_t pid = -1;
+      if (workers > 1 && pipe(fd) == 0) {
+        fflush(stdout);
+        fflush(stderr);
+        pid = fork();
+        if (pid < 0) close(fd[0]), close(fd[1]);
+      }
+      if (pid == 0) {
+        close(fd[0]);
+        std::vector<unsigned> m = Lsv_KlFlex(ntk, order, s.results[i], perCut);
+        const char* p = (const char*)m.data();
+        size_t left = m.size() * sizeof(unsigned);
+        while (left) {
+          ssize_t w = write(fd[1], p, left);
+          if (w <= 0) break;
+          p += w, left -= w;
+        }
+        _exit(0);
+      }
+      if (pid < 0) {  // no fork: do it here
+        all[i] = Lsv_KlFlex(ntk, order, s.results[i], perCut);
+        have[i] = 1;
+        continue;
+      }
+      close(fd[1]);
+      jobs.push_back({pid, fd[0], i, std::string()});
+    }
+    if (jobs.empty()) continue;
+    std::vector<struct pollfd> pfds;
+    for (const Job& j : jobs) pfds.push_back({j.fd, POLLIN, 0});
+    if (poll(pfds.data(), pfds.size(), -1) < 0) continue;
+    for (size_t k = jobs.size(); k-- > 0;) {
+      if (!pfds[k].revents) continue;
+      char tmp[4096];
+      ssize_t r = read(jobs[k].fd, tmp, sizeof tmp);
+      if (r > 0) {
+        jobs[k].buf.append(tmp, r);
+        continue;
+      }
+      finish(jobs[k]);
+      jobs.erase(jobs.begin() + k);
+    }
+  }
+  for (size_t i = 0; i < s.results.size(); ++i) {
+    if (!have[i]) all[i] = Lsv_KlFlex(ntk, order, s.results[i], 1);  // a child failed
+    std::vector<unsigned> roots = s.results[i].roots;
+    Lsv_KlPrint(s.results[i], all[i], roots, 0, s.l);
   }
   Vec_PtrFree(order);
   return 0;
