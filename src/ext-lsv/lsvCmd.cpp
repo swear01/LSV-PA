@@ -29,6 +29,9 @@
 #include <vector>
 
 #include <poll.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -333,6 +336,7 @@ struct LsvKlSearch {
   std::vector<unsigned> leaves;  // distinct leaves of the current union
   int stamp = 0, sizeS = 0, best = 0;
   std::vector<LsvKlCut> results;
+  std::map<std::vector<unsigned>, bool> escapes;
 
   Abc_Obj_t* Obj(unsigned id) const { return Abc_NtkObj(ntk, id); }
 
@@ -421,7 +425,18 @@ struct LsvKlSearch {
     Push(j);
     bool ok = true;
     for (int c : chosen) ok = ok && LeavesS(pairs[c].root);  // base cut only
-    for (size_t i = 0; ok && i < leaves.size(); ++i) ok = Escapes(leaves[i]);
+    if (ok) {
+      // K3 depends on the leaf set only, which many root sets share.
+      std::vector<unsigned> key = leaves;
+      std::sort(key.begin(), key.end());
+      auto it = escapes.find(key);
+      if (it == escapes.end()) {
+        for (size_t i = 0; ok && i < leaves.size(); ++i) ok = Escapes(leaves[i]);
+        escapes.emplace(std::move(key), ok);
+      } else {
+        ok = it->second;
+      }
+    }
     // Both checks only get worse when more roots are added.
     if (ok) {
       Record();
@@ -440,16 +455,27 @@ struct LsvKlSearch {
       for (size_t j = 0; j < pairs.size() && !Hopeless(j, 0); ++j) Try(j, 0);
       return;
     }
+    // Pairs from end on are hopeless (Hopeless is monotone in j).
+    int end = start;
+    for (int len = (int)pairs.size() - end; len > 0;) {
+      int half = len / 2;
+      if (!Hopeless(end + half, depth)) end += half + 1, len -= half + 1;
+      else len = half;
+    }
     // The next root's cut either shares a leaf with the current leaves ...
-    std::vector<int> shared;
+    // (merged in ascending order, without duplicates; Try may change leaves)
+    std::vector<std::pair<const int*, const int*>> runs;
     for (unsigned x : leaves) {
       const std::vector<int>& v = byLeaf[x];
-      shared.insert(shared.end(), std::lower_bound(v.begin(), v.end(), (int)start), v.end());
+      const int* b = std::lower_bound(v.data(), v.data() + v.size(), (int)start);
+      const int* e = std::lower_bound(b, v.data() + v.size(), end);
+      if (b < e) runs.push_back({b, e});
     }
-    std::sort(shared.begin(), shared.end());
-    shared.erase(std::unique(shared.begin(), shared.end()), shared.end());
-    for (int j : shared) {
-      if (Hopeless(j, depth)) break;
+    while (true) {
+      int j = end;
+      for (const auto& r : runs) if (r.first < r.second && *r.first < j) j = *r.first;
+      if (j == end) break;
+      for (auto& r : runs) if (r.first < r.second && *r.first == j) ++r.first;
       Try(j, depth);
     }
     // ... or is disjoint from them and small enough to fit.
@@ -568,6 +594,58 @@ static int Lsv_SatAig(Aig_Man_t* aig, int limit, std::vector<int>& model) {
   return st == SATOKO_UNSAT ? 1 : st == SATOKO_SAT ? 0 : -1;
 }
 
+// For all u at once: satisfiable iff for some u in us (u -> (v, root values))
+// and some c among its values, an X in the case pc with U(X) = u makes the
+// (single) PO of N[V <- c] differ from v. Leaves are not folded (u varies);
+// copy b's roots are new PIs of mt.
+static Abc_Obj_t* Lsv_KlMiterAll(Abc_Ntk_t* mt, Abc_Ntk_t* ntk, Vec_Ptr_t* order,
+                                 const LsvKlCut& cut, const std::vector<int>& pc,
+                                 const std::map<unsigned, std::pair<int, std::vector<unsigned>>>& us) {
+  int n = cut.leaves.size(), m = cut.roots.size();
+  Abc_Aig_t* man = (Abc_Aig_t*)mt->pManFunc;
+  size_t N = Abc_NtkObjNumMax(ntk);
+  std::vector<Abc_Obj_t*> base(N), b(N);
+  std::vector<char> tfo(N);
+  Abc_Obj_t* one = Abc_AigConst1(mt);
+  auto bit = [&](unsigned v, int w, int j) { return Abc_ObjNotCond(one, !((v >> (w - 1 - j)) & 1)); };
+  unsigned constId = Abc_ObjId(Abc_AigConst1(ntk));
+  base[constId] = b[constId] = one;
+  Abc_Obj_t* obj;
+  int i;
+  Abc_NtkForEachPi(ntk, obj, i) {
+    int v = pc[Abc_ObjId(obj)];
+    base[Abc_ObjId(obj)] = b[Abc_ObjId(obj)] = v < 0 ? Abc_NtkPi(mt, i) : Abc_ObjNotCond(one, !v);
+  }
+  std::vector<Abc_Obj_t*> rp(m);
+  for (int j = 0; j < m; ++j) tfo[cut.roots[j]] = 1, rp[j] = Abc_NtkCreatePi(mt);
+  Vec_PtrForEachEntry(Abc_Obj_t*, order, obj, i) {
+    unsigned id = Abc_ObjId(obj), f0 = Abc_ObjFaninId0(obj), f1 = Abc_ObjFaninId1(obj);
+    int c0 = Abc_ObjFaninC0(obj), c1 = Abc_ObjFaninC1(obj);
+    base[id] = Abc_AigAnd(man, Abc_ObjNotCond(base[f0], c0), Abc_ObjNotCond(base[f1], c1));
+    if (!tfo[id]) tfo[id] = tfo[f0] || tfo[f1];
+    b[id] = tfo[id] ? Abc_AigAnd(man, Abc_ObjNotCond(b[f0], c0), Abc_ObjNotCond(b[f1], c1)) : base[id];
+    for (int j = 0; j < m; ++j)
+      if (cut.roots[j] == id) b[id] = rp[j];
+  }
+  Abc_Obj_t* po = Abc_ObjNot(one);
+  Abc_NtkForEachPo(ntk, obj, i) po = Abc_ObjNotCond(b[Abc_ObjFaninId0(obj)], Abc_ObjFaninC0(obj));
+  Abc_Obj_t* care = Abc_ObjNot(one);
+  for (const auto& e : us) {
+    Abc_Obj_t* t = one;
+    for (int j = 0; j < n; ++j)
+      t = Abc_AigAnd(man, t, Abc_AigXor(man, base[cut.leaves[j]], Abc_ObjNot(bit(e.first, n, j))));
+    Abc_Obj_t* in = Abc_ObjNot(one);
+    for (unsigned ci : e.second.second) {
+      Abc_Obj_t* eq = one;
+      for (int j = 0; j < m; ++j) eq = Abc_AigAnd(man, eq, Abc_AigXor(man, rp[j], Abc_ObjNot(bit(ci, m, j))));
+      in = Abc_AigOr(man, in, eq);
+    }
+    // The PO differs from v for this u.
+    care = Abc_AigOr(man, care, Abc_AigAnd(man, Abc_AigAnd(man, t, in), Abc_ObjNotCond(po, e.second.first)));
+  }
+  return care;
+}
+
 // SAT on one Lsv_KlMiter output: 1 unsatisfiable, 0 satisfiable (cex set if
 // given), -1 gave up after limit conflicts (0: no limit; negative: strash only).
 static int Lsv_KlSolve(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned u,
@@ -608,7 +686,19 @@ static bool Lsv_KlDead(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, un
   size_t N = Abc_NtkObjNumMax(ntk);
   // Per node: values (0, 1, 2 = unknown) of the original, a and b copies, and
   // whether a and b may differ.
-  std::vector<unsigned char> vo(N), va(N), vb(N), d(N), tfo(N);
+  static std::vector<unsigned char> vo, va, vb, d, tfo;
+  static std::vector<signed char> role;  // root j: j + 1, leaf j: -(j + 1)
+  static std::vector<unsigned> roleKey;
+  for (auto* v : {&vo, &va, &vb, &d, &tfo}) v->assign(N, 0);
+  std::vector<unsigned> key(cut.leaves);
+  key.insert(key.end(), cut.roots.begin(), cut.roots.end());
+  key.push_back(n);
+  if (key != roleKey || role.size() != N) {
+    role.assign(N, 0);
+    for (int j = 0; j < n; ++j) role[cut.leaves[j]] = -(j + 1);
+    for (int j = 0; j < m; ++j) role[cut.roots[j]] = j + 1;
+    roleKey.swap(key);
+  }
   auto bit = [](unsigned v, int w, int j) { return (unsigned char)((v >> (w - 1 - j)) & 1); };
   auto And = [](unsigned char x, int cx, unsigned char y, int cy) -> unsigned char {
     if (x < 2) x ^= cx;
@@ -625,18 +715,16 @@ static bool Lsv_KlDead(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, un
   }
   for (int j = 0; j < m; ++j) tfo[cut.roots[j]] = 1;
   auto fix = [&](unsigned id) {  // as in Lsv_KlMiter
-    for (int j = 0; j < m; ++j)
-      if (cut.roots[j] == id) {
-        va[id] = bit(cu, m, j), vb[id] = bit(c, m, j), d[id] = va[id] != vb[id];
-        return;
-      }
-    if (tfo[id]) return;
-    for (int j = 0; j < n; ++j)
-      if (cut.leaves[j] == id) {
-        va[id] = vb[id] = bit(u, n, j), d[id] = 0;
-        if (Abc_ObjIsPi(Abc_NtkObj(ntk, id))) vo[id] = va[id];
-        return;
-      }
+    int r = role[id];
+    if (r > 0) {
+      int j = r - 1;
+      va[id] = bit(cu, m, j), vb[id] = bit(c, m, j), d[id] = va[id] != vb[id];
+      return;
+    }
+    if (r == 0 || tfo[id]) return;
+    int j = -r - 1;
+    va[id] = vb[id] = bit(u, n, j), d[id] = 0;
+    if (Abc_ObjIsPi(Abc_NtkObj(ntk, id))) vo[id] = va[id];
   };
   Abc_NtkForEachPi(ntk, obj, i) fix(Abc_ObjId(obj));
   Vec_PtrForEachEntry(Abc_Obj_t*, order, obj, i) {
@@ -742,6 +830,8 @@ struct LsvKlConst {
   const std::vector<std::map<int, int>>* cubes = nullptr;    // gate cube of each root
   std::map<std::pair<LsvKlKey, unsigned>, std::pair<int, std::vector<char>>> cases;  // Lsv_KlCase
   std::map<unsigned, std::vector<unsigned>> cs;  // u -> the c asked about
+  std::map<unsigned, unsigned> cu;               // u -> its original root values
+  std::map<LsvKlKey, std::set<unsigned>> allPass;  // per case: u whose PO is constant over cs[u] and cu
   std::map<LsvKlKey, int> csPass;  // whether copy b's PO is never !v there for any of cs[u]
 };
 static int Lsv_KlOrigConst(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned u,
@@ -790,6 +880,91 @@ static int Lsv_KlCase(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, uns
   return r;
 }
 
+// U(X) for the PI values x (pc's fixed PIs override).
+static unsigned Lsv_KlLeafValue(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
+                                const std::vector<int>& pc, const std::vector<int>& x) {
+  std::vector<char> v(Abc_NtkObjNumMax(ntk));
+  v[Abc_ObjId(Abc_AigConst1(ntk))] = 1;
+  Abc_Obj_t* obj;
+  int i;
+  Abc_NtkForEachPi(ntk, obj, i) {
+    int f = pc[Abc_ObjId(obj)];
+    v[Abc_ObjId(obj)] = f >= 0 ? f : x[i];
+  }
+  Vec_PtrForEachEntry(Abc_Obj_t*, order, obj, i)
+    v[Abc_ObjId(obj)] = (v[Abc_ObjFaninId0(obj)] ^ Abc_ObjFaninC0(obj)) & (v[Abc_ObjFaninId1(obj)] ^ Abc_ObjFaninC1(obj));
+  unsigned u = 0;
+  for (unsigned leaf : cut.leaves) u = u << 1 | v[leaf];
+  return u;
+}
+
+// Simulates the original network on 64-bit words of PI values (pc's fixed PIs
+// override; around x if given) and records, per u produced, which values the
+// (single) PO took: obs[u] bit b = PO was b.
+static void Lsv_KlSimObs(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
+                         const std::vector<int>& pc, const std::vector<int>* x, int words,
+                         std::mt19937_64& rng, std::map<unsigned, int>& obs) {
+  std::vector<uint64_t> v(Abc_NtkObjNumMax(ntk));
+  v[Abc_ObjId(Abc_AigConst1(ntk))] = ~uint64_t(0);
+  int nPis = Abc_NtkPiNum(ntk), n = cut.leaves.size();
+  Abc_Obj_t* obj;
+  int i;
+  for (int w = 0; w < words; ++w) {
+    Abc_NtkForEachPi(ntk, obj, i) {
+      uint64_t r;
+      if (x) {
+        r = (*x)[i] ? ~uint64_t(0) : 0;
+      } else {
+        r = rng();
+        if (w % 4 == 1) r &= rng() & rng();
+        if (w % 4 == 2) r |= rng() | rng();
+        if (w % 4 == 3) r &= rng() & rng() & rng() & rng();
+      }
+      v[Abc_ObjId(obj)] = r;
+    }
+    if (x)
+      for (int bit = 1; bit < 64; ++bit)
+        for (int k = 0; k <= bit % 3; ++k) v[Abc_ObjId(Abc_NtkPi(ntk, rng() % nPis))] ^= uint64_t(1) << bit;
+    Abc_NtkForEachPi(ntk, obj, i) {
+      int f = pc[Abc_ObjId(obj)];
+      if (f >= 0) v[Abc_ObjId(obj)] = f ? ~uint64_t(0) : 0;
+    }
+    Vec_PtrForEachEntry(Abc_Obj_t*, order, obj, i)
+      v[Abc_ObjId(obj)] = (v[Abc_ObjFaninId0(obj)] ^ (Abc_ObjFaninC0(obj) ? ~uint64_t(0) : 0)) &
+                          (v[Abc_ObjFaninId1(obj)] ^ (Abc_ObjFaninC1(obj) ? ~uint64_t(0) : 0));
+    Abc_Obj_t* po = Abc_NtkPo(ntk, 0);
+    uint64_t pv = v[Abc_ObjFaninId0(po)] ^ (Abc_ObjFaninC0(po) ? ~uint64_t(0) : 0);
+    for (int bit = 0; bit < 64; ++bit) {
+      unsigned u = 0;
+      for (int j = 0; j < n; ++j) u = u << 1 | ((v[cut.leaves[j]] >> bit) & 1);
+      obs[u] |= 1 << ((pv >> bit) & 1);
+    }
+  }
+}
+
+// SAT on Lsv_KlMiterAll: 1 unsatisfiable, 0 satisfiable (model: all PIs of the
+// miter, ntk's first), -1 gave up.
+static int Lsv_KlSolveAll(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
+                          const std::vector<int>& pc, int limit,
+                          const std::map<unsigned, std::pair<int, std::vector<unsigned>>>& us,
+                          std::vector<int>& model) {
+  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
+  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
+  Abc_Obj_t* mu = Lsv_KlMiterAll(mt, ntk, order, cut, pc, us);
+  int r = 1;
+  if (mu != Abc_ObjNot(Abc_AigConst1(mt))) {
+    Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
+    Abc_AigCleanup((Abc_Aig_t*)mt->pManFunc);
+    Abc_NtkAddDummyPiNames(mt);
+    Abc_NtkAddDummyPoNames(mt);
+    Aig_Man_t* aig = Abc_NtkToDar(mt, 0, 0);
+    r = Lsv_SatAig(aig, limit, model);
+    Aig_ManStop(aig);
+  }
+  Abc_NtkDelete(mt);
+  return r;
+}
+
 // asked: the c of the query, which c (with blocked roots reset) acts like.
 static int Lsv_KlCaseSolve(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, unsigned u,
                            unsigned cu, unsigned c, const std::vector<int>& pc, int limit,
@@ -799,18 +974,86 @@ static int Lsv_KlCaseSolve(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut
   if (Abc_NtkPoNum(ntk) == 1) {
     // Often both POs are the same constant here: check each side alone, much
     // easier than the miter.
-    int v = Lsv_KlOrigConst(ntk, order, cut, u, cu, pc, limit, cache);
-    // Mostly the copy's PO is v for every c asked about with this u: one call
-    // with its roots ranging over them settles them all.
+    // Mostly the PO is the same constant for cu and every c asked about with
+    // this u: one call with the copy's roots ranging over them settles them all.
     const std::vector<unsigned>& cs = cache.cs[u];
-    if (v >= 0 && std::find(cs.begin(), cs.end(), asked) != cs.end()) {
+    if (std::find(cs.begin(), cs.end(), asked) != cs.end()) {
+      LsvKlKey key = Lsv_KlKeyOf(~0u, pc);
+      auto it = cache.allPass.find(key);
+      if (it == cache.allPass.end()) {
+        std::map<unsigned, std::pair<int, std::vector<unsigned>>> us;
+        std::map<unsigned, int> obs;  // PO values seen per u (the original roots are in each set)
+        std::mt19937_64 rng(7);
+        Lsv_KlSimObs(ntk, order, cut, pc, nullptr, 4, rng, obs);
+        // Simulation uses the original roots: a u seen with both PO values
+        // has no constant original PO in this case.
+        for (const auto& e : obs)
+          if (e.second == 3 && cache.cs.count(e.first)) cache.orig[Lsv_KlKeyOf(e.first, pc)] = -1;
+        for (const auto& e : cache.cs) {
+          int o = obs.count(e.first) ? obs[e.first] : 0;
+          if (o == 3) continue;  // the PO is not constant
+          us[e.first] = {o == 2, e.second};
+          us[e.first].second.push_back(cache.cu[e.first]);
+        }
+        while (!us.empty()) {
+          std::vector<int> model;
+          int r = Lsv_KlSolveAll(ntk, order, cut, pc, limit, us, model);
+          if (r == 1) break;
+          if (r < 0) { us.clear(); break; }
+          unsigned w = Lsv_KlLeafValue(ntk, order, cut, pc, model);
+          auto f = us.find(w);
+          if (f == us.end()) { us.clear(); break; }  // cannot happen
+          // The model's PO is !v; its neighbours may show more.
+          obs[w] |= 1 << !f->second.first;
+          std::vector<int> x(model.begin(), model.begin() + Abc_NtkPiNum(ntk));
+          Lsv_KlSimObs(ntk, order, cut, pc, &x, 1, rng, obs);
+          for (auto it2 = us.begin(); it2 != us.end();) {
+            int o = obs.count(it2->first) ? obs[it2->first] : 0;
+            if (o == 3) it2 = us.erase(it2);
+            else {
+              if (o) it2->second.first = o == 2;
+              ++it2;
+            }
+          }
+        }
+        // Both PO values over the set: the mode-2 set check below must fail.
+        for (const auto& e : obs)
+          if (e.second == 3 && cache.cs.count(e.first)) cache.csPass[Lsv_KlKeyOf(e.first, pc)] = 0;
+        std::set<unsigned> ok;
+        for (const auto& e : us) {
+          ok.insert(e.first);
+          cache.orig[Lsv_KlKeyOf(e.first, pc)] = e.second.first;
+        }
+        it = cache.allPass.emplace(key, ok).first;
+      }
+      if (it->second.count(u)) return 1;
+    }
+    if (std::find(cs.begin(), cs.end(), asked) != cs.end()) {
       LsvKlKey key = Lsv_KlKeyOf(u, pc);
       auto it = cache.csPass.find(key);
-      if (it == cache.csPass.end())
-        it = cache.csPass.emplace(key, Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 2, !v, limit, nullptr, &cs)).first;
+      if (it == cache.csPass.end()) {
+        std::vector<unsigned> all = cs;
+        all.push_back(cu);
+        int w = -1;
+        for (int pol = 1; pol >= 0 && w < 0; --pol)
+          if (Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 2, pol, limit, nullptr, &all) == 1) w = !pol;
+        if (w >= 0) cache.orig[key] = w;  // the original is the copy at cu
+        it = cache.csPass.emplace(key, w >= 0).first;
+      }
       if (it->second == 1) return 1;
     }
+    int v = Lsv_KlOrigConst(ntk, order, cut, u, cu, pc, limit, cache);
     if (v >= 0 && Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 2, !v, limit, nullptr) == 1) return 1;
+  }
+  // The full miter, likewise once for all c asked about with this u first.
+  const std::vector<unsigned>& cs = cache.cs[u];
+  if (std::find(cs.begin(), cs.end(), asked) != cs.end()) {
+    LsvKlKey key = Lsv_KlKeyOf(u, pc);
+    key.second.push_back(-1);
+    auto it = cache.csPass.find(key);
+    if (it == cache.csPass.end())
+      it = cache.csPass.emplace(key, Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 0, 0, limit, nullptr, &cs) == 1).first;
+    if (it->second == 1) return 1;
   }
   return Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 0, 0, limit, &cex);
 }
@@ -950,7 +1193,10 @@ struct LsvKlSat {
   int N, mu, nVars;
   std::vector<char> tfo, isRoot;
   std::vector<int> pos, xors;
-  int limit1 = 100;  // conflicts for the PO-differs call
+  std::map<int, int> poXor;  // PO driver -> var of driver != copy
+  // Conflicts for the first PO-differs call: only the trivial cases settle
+  // there; with more, it mostly just spends them.
+  int limit1 = 1;
   unsigned polU = ~0u;
   std::vector<char> seenDiff, witness;
   std::vector<uint64_t> wO, wF;
@@ -991,6 +1237,7 @@ struct LsvKlSat {
       int d = Abc_ObjFaninId0(obj);
       if (!tfo[d]) continue;
       sat_solver_add_xor(s, mu + 1 + i, d, N + d, 0);
+      poXor[d] = mu + 1 + i;
       xors.push_back(mu + 1 + i);
       clause.push_back(Abc_Var2Lit(mu + 1 + i, 0));
     }
@@ -1186,9 +1433,13 @@ struct LsvKlSat {
         Abc_Obj_t* fo;
         int i;
         Abc_ObjForEachFanout(obj, fo, i) po = po || Abc_ObjIsPo(fo);
-        for (int pol = 0; pol < 2 && res != l_True; ++pol) {
-          a.push_back(Abc_Var2Lit(id, pol));
-          a.push_back(Abc_Var2Lit(N + id, !pol));
+        // A PO driver's pair differs iff its XOR variable is true: one call
+        // for both polarities.
+        auto px = poXor.find(id);
+        bool one = px != poXor.end();
+        for (int pol = 0; pol < 2 - one && res != l_True; ++pol) {
+          if (one) a.push_back(Abc_Var2Lit(px->second, 0)), a.push_back(Abc_Var2Lit(px->second, 0));
+          else a.push_back(Abc_Var2Lit(id, pol)), a.push_back(Abc_Var2Lit(N + id, !pol));
           // A PO driver gets a large budget at once: undecided, it would
           // only be redone in the next round.
           int r = Solve(a, po && L ? std::max(100000, 20 * L) : L);
@@ -1517,6 +1768,8 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
     Aig_Obj_t* o = Aig_ManCo(aig, i);
     return val[Aig_ObjFaninId0(o)] ^ (Aig_ObjFaninC0(o) ? ~uint64_t(0) : 0);
   };
+  std::vector<std::vector<char>> point(masks.size());  // an input pattern with U = u
+  long gain = 0;  // new (u, c) facts found by simulation
   auto simWord = [&]() {  // PI words are set by the caller
     std::vector<uint64_t> leafVal(n), rootVal(m);
     for (unsigned c = 0; c < (1u << m); ++c) {
@@ -1542,16 +1795,24 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
         for (int j = 0; j < n; ++j) u = u << 1 | ((leafVal[j] >> bit) & 1);
         if (c == 0) {
           for (int j = 0; j < m; ++j) r = r << 1 | ((rootVal[j] >> bit) & 1);
+          gain += !seen[u];
           seen[u] = 1;
           orig_c[u] = r;
+          if (point[u].empty())
+            for (int i = 0; i < nPis; ++i) point[u].push_back((val[Aig_ManCi(aig, i)->Id] >> bit) & 1);
         }
-        if ((mu >> bit) & 1) observed[u] |= 1u << c;
+        if (((mu >> bit) & 1) && !((observed[u] >> c) & 1)) observed[u] |= 1u << c, ++gain;
       }
     }
   };
   // Uniform, sparse and dense words: arithmetic circuits hide many differences
-  // behind operands with long runs of 0s or 1s.
-  for (int word = 0; word < 256; ++word) {
+  // behind operands with long runs of 0s or 1s. Without a chain, stop once 16
+  // words in a row find nothing new: the rest goes to SAT anyway.
+  for (int word = 0, last = 0; word < 256; ++word) {
+    if (chain.empty() && word % 16 == 0) {
+      if (word >= 32 && gain == last) break;
+      last = gain;
+    }
     for (int i = 0; i < nPis; ++i) {
       uint64_t r = rng();
       if (word % 4 == 1) r &= rng() & rng();
@@ -1575,9 +1836,14 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
     simWord();
   }
   // Random patterns rarely observe V in deep arithmetic. A SAT counterexample
-  // does, and so do many of its neighbours, often for other u and c as well.
+  // does, and so do many of its neighbours, often for other u and c as well;
+  // when 4 words in a row find nothing new, the rest would not either.
   auto simNear = [&](const std::vector<char>& x, int words) {
-    for (int word = 0; word < words; ++word) {
+    for (int word = 0, last = 0; word < words; ++word) {
+      if (word % 4 == 0) {
+        if (word && gain == last) break;
+        last = gain;
+      }
       std::vector<uint64_t> w(nPis);
       for (int i = 0; i < nPis; ++i) w[i] = x[i] ? ~uint64_t(0) : 0;
       for (int bit = 1; bit < 64; ++bit)
@@ -1595,59 +1861,39 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
   };
   std::vector<std::array<unsigned, 3>> tasks;             // (u, cu, c) for the sweep
   std::vector<std::array<unsigned, 3>> pending;           // (u, cu, c) left for batching
-  Cnf_Dat_t* cnf = Cnf_Derive(aig, Aig_ManCoNum(aig));
-  sat_solver* sat = (sat_solver*)Cnf_DataWriteIntoSolver(cnf, 1, 0);
-  if (sat) {
-    auto coVar = [&](int i) { return cnf->pVarNums[Aig_ManCo(aig, i)->Id]; };
-    std::vector<lit> lits(n);
+  // SAT only for the u simulation never produced.
+  Cnf_Dat_t* cnf = nullptr;
+  sat_solver* sat = nullptr;
+  {
     for (unsigned u = 0; u < masks.size(); ++u) {
-      for (int j = 0; j < n; ++j) lits[j] = Abc_Var2Lit(coVar(j), !((u >> (n - 1 - j)) & 1));
-      int pt = l_Undef;  // a point with U = u in the solver's model
       if (!seen[u]) {
-        pt = sat_solver_solve(sat, lits.data(), lits.data() + n, 0, 0, 0, 0);
+        if (!cnf) {
+          cnf = Cnf_Derive(aig, Aig_ManCoNum(aig));
+          sat = (sat_solver*)Cnf_DataWriteIntoSolver(cnf, 1, 0);
+        }
+        if (!sat) continue;  // contradictory at once: no u is produced
+        auto coVar = [&](int i) { return cnf->pVarNums[Aig_ManCo(aig, i)->Id]; };
+        std::vector<lit> lits(n);
+        for (int j = 0; j < n; ++j) lits[j] = Abc_Var2Lit(coVar(j), !((u >> (n - 1 - j)) & 1));
+        int pt = sat_solver_solve(sat, lits.data(), lits.data() + n, 0, 0, 0, 0);
         if (pt == l_False) continue;  // u is never produced: everything is allowed
         orig_c[u] = 0;
         for (int j = 0; j < m; ++j)
           orig_c[u] = orig_c[u] << 1 | sat_solver_var_value(sat, coVar(n + 1 + j));
-      } else if (observed[u] != full) {
-        pt = sat_solver_solve(sat, lits.data(), lits.data() + n, 10000, 0, 0, 0);
-      }
-      if (pt == l_True) {  // patterns near it mostly keep U = u: more chances to observe c
-        std::vector<char> x(nPis);
+        point[u].assign(nPis, 0);
         for (int i = 0; i < nPis; ++i) {
           int v = cnf->pVarNums[Aig_ManCi(aig, i)->Id];
-          x[i] = v >= 0 && sat_solver_var_value(sat, v);
+          point[u][i] = v >= 0 && sat_solver_var_value(sat, v);
         }
-        simNear(x, 16);
       }
+      // Patterns near a point with U = u mostly keep U = u: more chances to observe c.
+      if (observed[u] != full) simNear(point[u], 16);
       masks[u] = 1u << orig_c[u];  // the original root values are always fine
       for (unsigned c = 0; c < (1u << m); ++c)
         if (c != orig_c[u] && !((observed[u] >> c) & 1)) tasks.push_back({u, orig_c[u], c});
     }
-    // The original PO's constant in the last chain cases (where most queries
-    // stay live), once per u for all c: computed in parallel, inherited by the
-    // query workers.
     LsvKlConst oc;
     oc.cubes = &cubes;
-    if (!chain.empty() && Abc_NtkPoNum(ntk) == 1) {
-      std::map<unsigned, unsigned> us;  // u -> cu
-      for (const auto& t : tasks) us[t[0]] = t[1];
-      std::vector<std::pair<unsigned, std::vector<int>>> pre;
-      for (const auto& uc : us)
-        for (int i = (int)chain.size(); i >= (int)chain.size() - 1 && i >= 0; --i) {
-          std::vector<int> pc(orig.size(), -1);
-          for (int k = 0; k < i; ++k) pc[chain[k].first] = chain[k].second;
-          if (i < (int)chain.size()) pc[chain[i].first] = !chain[i].second;
-          pre.push_back({uc.first, pc});
-        }
-      std::vector<int> vs = Lsv_Pool(pre.size(), workers, [&](int k) {
-        LsvKlConst tmp;
-        return Lsv_KlOrigConst(ntk, order, cut, pre[k].first, us[pre[k].first], pre[k].second, 1000000, tmp) + 1;
-      });
-      // A lost worker (-1) leaves its entry out: computed again when needed.
-      for (size_t k = 0; k < pre.size(); ++k)
-        if (vs[k] >= 0) oc.orig[Lsv_KlKeyOf(pre[k].first, pre[k].second)] = vs[k] - 1;
-    }
     // Root j with gate cube G_j is unobservable where G_j fails, so there
     // c acts like c2 = c with root j back at cu. Hence if c2 is allowed, only
     // the single case G_j remains; and a counterexample of c2 found there is
@@ -1711,6 +1957,7 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
       for (size_t i = 0; i < tasks.size(); ++i) {
         g[tasks[i][0]].push_back(i);
         oc.cs[tasks[i][0]].push_back(tasks[i][2]);
+        oc.cu[tasks[i][0]] = tasks[i][1];
       }
       for (auto& kv : g) byU.push_back(kv.second);
     }
@@ -1764,9 +2011,9 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
         if (q == 1) masks[u] |= 1u << c;
       }
     }
-    sat_solver_delete(sat);
   }
-  Cnf_DataFree(cnf);
+  if (sat) sat_solver_delete(sat);
+  if (cnf) Cnf_DataFree(cnf);
   Aig_ManStop(aig);
   Abc_NtkDelete(miter);
   return masks;
@@ -1874,6 +2121,11 @@ static int Lsv_CommandKlFlex(Abc_Frame_t* frame, int argc, char** argv) {
   std::vector<std::vector<unsigned>> all(s.results.size());
   std::vector<char> have(s.results.size());
   long cores = sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __linux__
+  // Only the cores this process may run on (taskset, container limits).
+  cpu_set_t set;
+  if (sched_getaffinity(0, sizeof set, &set) == 0) cores = CPU_COUNT(&set);
+#endif
   size_t workers = cores > 1 ? (size_t)cores : 1;
   // Each cut also spreads its own queries over the cores, oversubscribed up to
   // 4x in total: the OS shares them, so cores freed by finished cuts go to the
