@@ -990,7 +990,7 @@ struct LsvKlSat {
         if (spread(obj) && result == 1) open = true;  // an unsettled PO driver
         // Undecided pairs make their whole TFO undecided too: past a few, the
         // budget is just too small, so go to the next round right away.
-        if (L && nUnd > 100) {
+        if (L && nUnd > 10) {
           open = true;
           break;
         }
