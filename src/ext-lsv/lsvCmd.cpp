@@ -18,7 +18,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iterator>
 #include <map>
 #include <memory>
 #include <random>
@@ -312,6 +311,18 @@ static int Lsv_CommandCutBddSize(Abc_Frame_t* frame, int argc, char** argv) {
 // that root, so each cut is generated exactly once by picking, for distinct
 // roots, one PA1 cut each, and requiring that no leaf lies inside another
 // root's region (else the first-hit sets would differ).
+//
+// A(u) per base cut (Lsv_KlFlex), cheapest first; only "not allowed" is ever
+// concluded without a proof, from a concrete input pattern:
+//   1. Simulation finds the produced u, their root values cu and most c a PO
+//      observes. SAT finds a pattern for the u simulation missed.
+//   2. Cuts whose roots are gated by PI literals (Lsv_KlGateCube) are split
+//      into disjoint cases over those literals (Lsv_KlChain); fixed PIs fold
+//      most cases away in strash, the rest are small SAT calls (Lsv_KlCase).
+//   3. Otherwise an incremental sweep (LsvKlSat) proves original and flipped
+//      copy equal node by node under the care set U = u.
+//   4. Leftovers: batched fraig, then a race of exact engines (Lsv_Race).
+// Cuts and queries run in forked children (Lsv_Pool and the loop at the end).
 
 namespace {
 
@@ -655,9 +666,9 @@ static int Lsv_KlSolve(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, un
   Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
   for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
   Abc_Obj_t* mu = Lsv_KlMiter(mt, ntk, order, cut, u, cu, c, &pc, mode, pol, cs);
-  int r = 1;
-  if (mu != Abc_ObjNot(Abc_AigConst1(mt)) && limit < 0) r = -1;  // strash only
-  else if (mu != Abc_ObjNot(Abc_AigConst1(mt))) {
+  bool folded = mu == Abc_ObjNot(Abc_AigConst1(mt));
+  int r = folded ? 1 : -1;  // limit < 0: strash only
+  if (!folded && limit >= 0) {
     Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
     Abc_AigCleanup((Abc_Aig_t*)mt->pManFunc);
     Abc_NtkAddDummyPiNames(mt);
@@ -972,10 +983,9 @@ static int Lsv_KlCaseSolve(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut
   if (Lsv_KlDead(ntk, order, cut, u, cu, c, pc)) return 1;
   if (Lsv_KlSolve(ntk, order, cut, u, cu, c, pc, 0, 0, -1, nullptr) == 1) return 1;
   if (Abc_NtkPoNum(ntk) == 1) {
-    // Often both POs are the same constant here: check each side alone, much
-    // easier than the miter.
-    // Mostly the PO is the same constant for cu and every c asked about with
-    // this u: one call with the copy's roots ranging over them settles them all.
+    // Often the PO is the same constant for cu and every c asked about here:
+    // checking that is much easier than the miter. First for all u in one call
+    // (values guessed by simulation), then for this u, then for c alone.
     const std::vector<unsigned>& cs = cache.cs[u];
     if (std::find(cs.begin(), cs.end(), asked) != cs.end()) {
       LsvKlKey key = Lsv_KlKeyOf(~0u, pc);
@@ -1568,17 +1578,14 @@ static std::vector<int> Lsv_Timed(const std::function<std::vector<int>()>& f, si
   close(fd[1]);
   std::vector<int> res(n, -1), buf(n);
   size_t want = n * sizeof(int), got = 0;
-  abctime end = Abc_Clock() + (abctime)ms * CLOCKS_PER_SEC / 1000;
   while (got < want) {
-    // Abc_Clock is CPU time of this process, which waits; use poll's timeout.
+    // ponytail: ms bounds each wait for data, not the total; fine for one result block.
     struct pollfd pfd = {fd[0], POLLIN, 0};
-    int r = poll(&pfd, 1, ms);
-    if (r <= 0) break;
+    if (poll(&pfd, 1, ms) <= 0) break;
     ssize_t k = read(fd[0], (char*)buf.data() + got, want - got);
     if (k <= 0) break;
     got += k;
   }
-  (void)end;
   if (got == want) res = buf;
   else kill(pid, SIGKILL);
   close(fd[0]);
@@ -1924,10 +1931,6 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
           if (q < 0) q = sw->Query(u, cu, c, cex, 2000);
           return q;
         };
-    // Queries are independent: spread them over the cores. A sweep over a copy
-    // of most of the network rarely settles an allowed c but does find
-    // counterexamples: try it with a bounded budget here; batched fraig and the
-    // full sweep below take what is left.
     // Without a chain, first try to prove all of the cut's queries in one
     // sweep; a counterexample rules one of them out, then try the rest again.
     while (chain.empty() && tasks.size() >= 2) {
@@ -1961,6 +1964,8 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
       }
       for (auto& kv : g) byU.push_back(kv.second);
     }
+    // The rest are independent: spread them over the cores with bounded
+    // budgets; batched fraig and the race below take what is left.
     std::vector<int> qs = Lsv_Pool(tasks.size(), workers, [&](int i) {
       std::vector<char> cex;
       return solve(tasks[i][0], tasks[i][1], tasks[i][2], cex);
