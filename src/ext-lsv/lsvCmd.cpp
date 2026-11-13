@@ -1118,8 +1118,8 @@ static int Lsv_KlChain(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, un
 // and leaves outside the TFO of V become constants too; strash then folds most
 // of the miter away before SAT sees it.
 // Returns 1 (allowed), 0 (not) or -1 (gave up; only with a positive limit on
-// the conflicts of fraig's final SAT call). A negative limit means plain SAT
-// without fraig.
+// the conflicts of fraig's final SAT call). Limit 0: bounded SAT, then fraig,
+// then unbounded SAT; -1: unbounded bsat alone; -2: unbounded CaDiCaL alone.
 static int Lsv_KlAllowed(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
                          unsigned u, unsigned cu, unsigned c, std::vector<char>& cex,
                          int limit) {
@@ -1549,6 +1549,16 @@ static std::vector<int> Lsv_KlBatch(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvK
   return res;
 }
 
+// Writes all n bytes of data to fd (a child's result to its parent).
+static void Lsv_WriteAll(int fd, const void* data, size_t n) {
+  const char* p = (const char*)data;
+  while (n) {
+    ssize_t w = write(fd, p, n);
+    if (w <= 0) return;
+    p += w, n -= w;
+  }
+}
+
 // Runs f in a forked child and returns its result, or n times -1 if it takes
 // longer than ms: ABC's fraiging cannot be stopped from inside. Without fork,
 // f just runs here.
@@ -1566,13 +1576,7 @@ static std::vector<int> Lsv_Timed(const std::function<std::vector<int>()>& f, si
   if (pid == 0) {
     close(fd[0]);
     std::vector<int> r = f();
-    const char* p = (const char*)r.data();
-    size_t left = r.size() * sizeof(int);
-    while (left) {
-      ssize_t w = write(fd[1], p, left);
-      if (w <= 0) break;
-      p += w, left -= w;
-    }
+    Lsv_WriteAll(fd[1], r.data(), r.size() * sizeof(int));
     _exit(0);
   }
   close(fd[1]);
@@ -2012,6 +2016,12 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
                           std::vector<char> x;
                           return sw->Query(u, cu, c, x, 0);
                         }});
+        // Every child died (no fork, out of memory): decide it here, unbounded,
+        // rather than report "not allowed" without a counterexample.
+        if (q < 0) {
+          std::vector<char> x;
+          q = Lsv_KlAllowed(ntk, order, cut, u, cu, c, x, 0);
+        }
         if (!cex.empty()) simNear(cex, 4);
         if (q == 1) masks[u] |= 1u << c;
       }
@@ -2163,13 +2173,7 @@ static int Lsv_CommandKlFlex(Abc_Frame_t* frame, int argc, char** argv) {
       if (pid == 0) {
         close(fd[0]);
         std::vector<unsigned> m = Lsv_KlFlex(ntk, order, s.results[i], perCut);
-        const char* p = (const char*)m.data();
-        size_t left = m.size() * sizeof(unsigned);
-        while (left) {
-          ssize_t w = write(fd[1], p, left);
-          if (w <= 0) break;
-          p += w, left -= w;
-        }
+        Lsv_WriteAll(fd[1], m.data(), m.size() * sizeof(unsigned));
         _exit(0);
       }
       if (pid < 0) {  // no fork: do it here
