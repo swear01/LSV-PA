@@ -504,6 +504,22 @@ struct LsvKlSearch {
 
 }  // namespace
 
+// An empty AIG whose PIs match ntk's, for the miters below.
+static Abc_Ntk_t* Lsv_KlNewMiter(Abc_Ntk_t* ntk) {
+  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
+  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
+  return mt;
+}
+
+// mt as an Aig_Man_t for SAT and fraig, with po (if given) as a new output.
+static Aig_Man_t* Lsv_KlToAig(Abc_Ntk_t* mt, Abc_Obj_t* po = nullptr) {
+  if (po) Abc_ObjAddFanin(Abc_NtkCreatePo(mt), po);
+  Abc_AigCleanup((Abc_Aig_t*)mt->pManFunc);
+  Abc_NtkAddDummyPiNames(mt);
+  Abc_NtkAddDummyPoNames(mt);
+  return Abc_NtkToDar(mt, 0, 0);
+}
+
 // Adds to mt (whose PIs match ntk's) the miter output for (u, c): satisfiable
 // iff some X with U(X) = u makes a PO of N[V <- c] differ from N. pc (by object
 // id, -1 = free) fixes PIs. Mode 1 / 2 (single PO): satisfiable iff the PO of
@@ -663,17 +679,12 @@ static int Lsv_KlSolve(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, un
                        unsigned cu, unsigned c, const std::vector<int>& pc, int mode,
                        int pol, int limit, std::vector<char>* cex,
                        const std::vector<unsigned>* cs = nullptr) {
-  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
-  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
+  Abc_Ntk_t* mt = Lsv_KlNewMiter(ntk);
   Abc_Obj_t* mu = Lsv_KlMiter(mt, ntk, order, cut, u, cu, c, &pc, mode, pol, cs);
   bool folded = mu == Abc_ObjNot(Abc_AigConst1(mt));
   int r = folded ? 1 : -1;  // limit < 0: strash only
   if (!folded && limit >= 0) {
-    Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
-    Abc_AigCleanup((Abc_Aig_t*)mt->pManFunc);
-    Abc_NtkAddDummyPiNames(mt);
-    Abc_NtkAddDummyPoNames(mt);
-    Aig_Man_t* aig = Abc_NtkToDar(mt, 0, 0);
+    Aig_Man_t* aig = Lsv_KlToAig(mt, mu);
     // Satoko settles these about twice as fast as dsat.
     std::vector<int> model;
     r = Lsv_SatAig(aig, limit, model);
@@ -909,6 +920,27 @@ static unsigned Lsv_KlLeafValue(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut
   return u;
 }
 
+// A random PI word: uniform, sparse or dense by word % 4. Arithmetic circuits
+// hide many differences behind operands with long runs of 0s or 1s.
+static uint64_t Lsv_RandWord(std::mt19937_64& rng, int word) {
+  uint64_t r = rng();
+  if (word % 4 == 1) r &= rng() & rng();
+  if (word % 4 == 2) r |= rng() | rng();
+  if (word % 4 == 3) r &= rng() & rng() & rng() & rng();
+  return r;
+}
+
+// PI words holding x in bit 0 and, in bits 1..63, neighbours of x with 1 to 3
+// PIs flipped.
+template <class T>
+static std::vector<uint64_t> Lsv_NearWords(const std::vector<T>& x, int nPis, std::mt19937_64& rng) {
+  std::vector<uint64_t> w(nPis);
+  for (int i = 0; i < nPis; ++i) w[i] = x[i] ? ~uint64_t(0) : 0;
+  for (int bit = 1; bit < 64; ++bit)
+    for (int k = 0; k <= bit % 3; ++k) w[rng() % nPis] ^= uint64_t(1) << bit;
+  return w;
+}
+
 // Simulates the original network on 64-bit words of PI values (pc's fixed PIs
 // override; around x if given) and records, per u produced, which values the
 // (single) PO took: obs[u] bit b = PO was b.
@@ -921,24 +953,12 @@ static void Lsv_KlSimObs(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
   Abc_Obj_t* obj;
   int i;
   for (int w = 0; w < words; ++w) {
-    Abc_NtkForEachPi(ntk, obj, i) {
-      uint64_t r;
-      if (x) {
-        r = (*x)[i] ? ~uint64_t(0) : 0;
-      } else {
-        r = rng();
-        if (w % 4 == 1) r &= rng() & rng();
-        if (w % 4 == 2) r |= rng() | rng();
-        if (w % 4 == 3) r &= rng() & rng() & rng() & rng();
-      }
-      v[Abc_ObjId(obj)] = r;
-    }
-    if (x)
-      for (int bit = 1; bit < 64; ++bit)
-        for (int k = 0; k <= bit % 3; ++k) v[Abc_ObjId(Abc_NtkPi(ntk, rng() % nPis))] ^= uint64_t(1) << bit;
+    std::vector<uint64_t> in(nPis);
+    if (x) in = Lsv_NearWords(*x, nPis, rng);
+    else for (int k = 0; k < nPis; ++k) in[k] = Lsv_RandWord(rng, w);
     Abc_NtkForEachPi(ntk, obj, i) {
       int f = pc[Abc_ObjId(obj)];
-      if (f >= 0) v[Abc_ObjId(obj)] = f ? ~uint64_t(0) : 0;
+      v[Abc_ObjId(obj)] = f < 0 ? in[i] : f ? ~uint64_t(0) : 0;
     }
     Vec_PtrForEachEntry(Abc_Obj_t*, order, obj, i)
       v[Abc_ObjId(obj)] = (v[Abc_ObjFaninId0(obj)] ^ (Abc_ObjFaninC0(obj) ? ~uint64_t(0) : 0)) &
@@ -959,16 +979,11 @@ static int Lsv_KlSolveAll(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
                           const std::vector<int>& pc, int limit,
                           const std::map<unsigned, std::pair<int, std::vector<unsigned>>>& us,
                           std::vector<int>& model) {
-  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
-  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
+  Abc_Ntk_t* mt = Lsv_KlNewMiter(ntk);
   Abc_Obj_t* mu = Lsv_KlMiterAll(mt, ntk, order, cut, pc, us);
   int r = 1;
   if (mu != Abc_ObjNot(Abc_AigConst1(mt))) {
-    Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
-    Abc_AigCleanup((Abc_Aig_t*)mt->pManFunc);
-    Abc_NtkAddDummyPiNames(mt);
-    Abc_NtkAddDummyPoNames(mt);
-    Aig_Man_t* aig = Abc_NtkToDar(mt, 0, 0);
+    Aig_Man_t* aig = Lsv_KlToAig(mt, mu);
     r = Lsv_SatAig(aig, limit, model);
     Aig_ManStop(aig);
   }
@@ -1123,18 +1138,12 @@ static int Lsv_KlChain(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, un
 static int Lsv_KlAllowed(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
                          unsigned u, unsigned cu, unsigned c, std::vector<char>& cex,
                          int limit) {
-  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
-  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
-  Abc_Aig_t* man = (Abc_Aig_t*)mt->pManFunc;
+  Abc_Ntk_t* mt = Lsv_KlNewMiter(ntk);
   Abc_Obj_t* one = Abc_AigConst1(mt);
   Abc_Obj_t* mu = Lsv_KlMiter(mt, ntk, order, cut, u, cu, c);
   int allowed = mu == Abc_ObjNot(one);
   if (!allowed) {
-    Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
-    Abc_AigCleanup(man);
-    Abc_NtkAddDummyPiNames(mt);
-    Abc_NtkAddDummyPoNames(mt);
-    Aig_Man_t* aig = Abc_NtkToDar(mt, 0, 0);
+    Aig_Man_t* aig = Lsv_KlToAig(mt, mu);
     // Plain SAT settles most calls; the rest go to fraig-based CEC, whose SAT
     // sweeping merges the equal parts of the two copies.
     Cnf_Dat_t* cnf = Cnf_Derive(aig, 1);
@@ -1268,10 +1277,7 @@ struct LsvKlSat {
   // U = u, records which nodes differ. Returns whether a PO differs (cex set).
   bool Simulate(const std::vector<char>& x, unsigned u, unsigned c, std::vector<char>& cex) {
     int n = cut.leaves.size(), m = cut.roots.size(), nPis = Abc_NtkPiNum(ntk);
-    std::vector<uint64_t> w(nPis);
-    for (int i = 0; i < nPis; ++i) w[i] = x[i] ? ~uint64_t(0) : 0;
-    for (int bit = 1; bit < 64; ++bit)
-      for (int k = 0; k <= bit % 3; ++k) w[rng() % nPis] ^= uint64_t(1) << bit;
+    std::vector<uint64_t> w = Lsv_NearWords(x, nPis, rng);
     Abc_Obj_t* obj;
     int i;
     wO[Abc_ObjId(Abc_AigConst1(ntk))] = ~uint64_t(0);
@@ -1497,8 +1503,7 @@ struct LsvKlSat {
 static std::vector<int> Lsv_KlBatch(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut,
                                     const std::vector<std::array<unsigned, 3>>& items) {
   std::vector<int> res(items.size(), -1);
-  Abc_Ntk_t* mt = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
-  for (int i = 0; i < Abc_NtkPiNum(ntk); ++i) Abc_NtkCreatePi(mt);
+  Abc_Ntk_t* mt = Lsv_KlNewMiter(ntk);
   Abc_Obj_t* zero = Abc_ObjNot(Abc_AigConst1(mt));
   bool open = false;
   for (const auto& it : items) {
@@ -1507,10 +1512,7 @@ static std::vector<int> Lsv_KlBatch(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvK
     Abc_ObjAddFanin(Abc_NtkCreatePo(mt), mu);
   }
   if (open) {
-    Abc_AigCleanup((Abc_Aig_t*)mt->pManFunc);
-    Abc_NtkAddDummyPiNames(mt);
-    Abc_NtkAddDummyPoNames(mt);
-    Aig_Man_t* aig = Abc_NtkToDar(mt, 0, 0);
+    Aig_Man_t* aig = Lsv_KlToAig(mt);
     Aig_Man_t* t = aig;
     aig = Dar_ManRwsat(t, 1, 0);
     Aig_ManStop(t);
@@ -1699,108 +1701,144 @@ static std::vector<int> Lsv_Pool(size_t n, size_t workers, const std::function<i
   return res;
 }
 
-// Returns A(u) as a bit mask over root values c, for every leaf value u.
-static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
-                                        const LsvKlCut& cut, size_t workers) {
-  int n = cut.leaves.size(), m = cut.roots.size();
-  unsigned full = (1u << (1 << m)) - 1;
-  std::vector<unsigned> masks(1u << n, full);
+// A(u) for one base cut, cheapest step first (see the overview at the top of
+// PA2). masks[u] is A(u) as a bit mask over the root values c.
+struct LsvKlFlex {
+  typedef std::array<unsigned, 3> Item;  // (u, cu, c): is c in A(u)? cu: u's original root values
+  Abc_Ntk_t* ntk;
+  Vec_Ptr_t* order;
+  const LsvKlCut& cut;
+  size_t workers;
+  int n, m, N, nPis;
+  unsigned full;
+  std::vector<unsigned> masks;
 
-  Abc_Ntk_t* miter = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
-  Abc_Aig_t* man = (Abc_Aig_t*)miter->pManFunc;
-  std::vector<Abc_Obj_t*> orig(Abc_NtkObjNumMax(ntk)), forced(orig.size());
-  std::vector<char> tfo(orig.size());
-  unsigned constId = Abc_ObjId(Abc_AigConst1(ntk));
-  orig[constId] = forced[constId] = Abc_AigConst1(miter);
-  Abc_Obj_t* obj;
-  int i;
-  Abc_NtkForEachPi(ntk, obj, i) orig[Abc_ObjId(obj)] = forced[Abc_ObjId(obj)] =
-      Abc_NtkCreatePi(miter);
-  for (int j = 0; j < m; ++j) {
-    forced[cut.roots[j]] = Abc_NtkCreatePi(miter);
-    tfo[cut.roots[j]] = 1;
+  // The miter of the spec as an AIG. CIs: the PIs, then the forced root values
+  // p. COs: the leaves, mu, then the original roots.
+  Aig_Man_t* aig = nullptr;
+  std::vector<char> tfo;      // TFO of V in ntk
+  std::vector<int> rootTfo;   // AIG nodes that depend on p, topological
+  // Gate cube of each root, and the chain of their PI literals, highest PI first.
+  std::vector<std::map<int, int>> cubes;
+  std::vector<std::pair<int, int>> chain;
+
+  // Simulation results per u: produced, its root values, the c a PO observed,
+  // and an input pattern with U = u.
+  std::vector<char> seen;
+  std::vector<unsigned> orig_c, observed;
+  std::vector<std::vector<char>> point;
+  std::vector<uint64_t> val;  // simulation words of the AIG nodes
+  long gain = 0;              // new facts found by simulation
+  std::mt19937_64 rng{1};
+
+  std::map<unsigned, std::unique_ptr<LsvKlSat>> sweeps;  // by flipped roots, built lazily
+  LsvKlConst oc;
+
+  LsvKlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order, const LsvKlCut& cut, size_t workers)
+      : ntk(ntk), order(order), cut(cut), workers(workers), n(cut.leaves.size()),
+        m(cut.roots.size()), N(Abc_NtkObjNumMax(ntk)), nPis(Abc_NtkPiNum(ntk)),
+        full((1u << (1 << m)) - 1), masks(1u << n, full), seen(masks.size()),
+        orig_c(masks.size()), observed(masks.size()), point(masks.size()) {}
+  ~LsvKlFlex() {
+    if (aig) Aig_ManStop(aig);
   }
-  Vec_PtrForEachEntry(Abc_Obj_t*, order, obj, i) {
-    unsigned id = Abc_ObjId(obj), f0 = Abc_ObjFaninId0(obj), f1 = Abc_ObjFaninId1(obj);
-    orig[id] = Abc_AigAnd(man, Abc_ObjNotCond(orig[f0], Abc_ObjFaninC0(obj)),
-                          Abc_ObjNotCond(orig[f1], Abc_ObjFaninC1(obj)));
-    if (tfo[id]) continue;  // a root: already a new PI
-    if (tfo[f0] || tfo[f1]) {
-      tfo[id] = 1;
-      forced[id] = Abc_AigAnd(man, Abc_ObjNotCond(forced[f0], Abc_ObjFaninC0(obj)),
-                              Abc_ObjNotCond(forced[f1], Abc_ObjFaninC1(obj)));
-    } else {
-      forced[id] = orig[id];
+
+  std::vector<unsigned> Run() {
+    BuildMiter();
+    FindChain();
+    SimRandom();
+    std::vector<Item> tasks = Tasks();
+    if (chain.empty()) SolveTogether(tasks);
+    SolveLeftovers(SolveEach(tasks));
+    return masks;
+  }
+
+  void BuildMiter() {
+    Abc_Ntk_t* miter = Abc_NtkAlloc(ABC_NTK_STRASH, ABC_FUNC_AIG, 1);
+    Abc_Aig_t* man = (Abc_Aig_t*)miter->pManFunc;
+    std::vector<Abc_Obj_t*> orig(N), forced(N);
+    tfo.assign(N, 0);
+    unsigned constId = Abc_ObjId(Abc_AigConst1(ntk));
+    orig[constId] = forced[constId] = Abc_AigConst1(miter);
+    Abc_Obj_t* obj;
+    int i;
+    Abc_NtkForEachPi(ntk, obj, i) orig[Abc_ObjId(obj)] = forced[Abc_ObjId(obj)] =
+        Abc_NtkCreatePi(miter);
+    for (int j = 0; j < m; ++j) {
+      forced[cut.roots[j]] = Abc_NtkCreatePi(miter);
+      tfo[cut.roots[j]] = 1;
     }
-  }
-  Abc_Obj_t* mu = Abc_ObjNot(Abc_AigConst1(miter));
-  Abc_NtkForEachPo(ntk, obj, i) {
-    unsigned d = Abc_ObjFaninId0(obj);
-    if (tfo[d]) mu = Abc_AigOr(man, mu, Abc_AigXor(man, orig[d], forced[d]));
-  }
-  for (unsigned leaf : cut.leaves) Abc_ObjAddFanin(Abc_NtkCreatePo(miter), orig[leaf]);
-  Abc_ObjAddFanin(Abc_NtkCreatePo(miter), mu);
-  for (unsigned root : cut.roots) Abc_ObjAddFanin(Abc_NtkCreatePo(miter), orig[root]);
-  Abc_AigCleanup(man);
-  Abc_NtkAddDummyPiNames(miter);
-  Abc_NtkAddDummyPoNames(miter);
+    Vec_PtrForEachEntry(Abc_Obj_t*, order, obj, i) {
+      unsigned id = Abc_ObjId(obj), f0 = Abc_ObjFaninId0(obj), f1 = Abc_ObjFaninId1(obj);
+      orig[id] = Abc_AigAnd(man, Abc_ObjNotCond(orig[f0], Abc_ObjFaninC0(obj)),
+                            Abc_ObjNotCond(orig[f1], Abc_ObjFaninC1(obj)));
+      if (tfo[id]) continue;  // a root: already a new PI
+      if (tfo[f0] || tfo[f1]) {
+        tfo[id] = 1;
+        forced[id] = Abc_AigAnd(man, Abc_ObjNotCond(forced[f0], Abc_ObjFaninC0(obj)),
+                                Abc_ObjNotCond(forced[f1], Abc_ObjFaninC1(obj)));
+      } else {
+        forced[id] = orig[id];
+      }
+    }
+    Abc_Obj_t* mu = Abc_ObjNot(Abc_AigConst1(miter));
+    Abc_NtkForEachPo(ntk, obj, i) {
+      unsigned d = Abc_ObjFaninId0(obj);
+      if (tfo[d]) mu = Abc_AigOr(man, mu, Abc_AigXor(man, orig[d], forced[d]));
+    }
+    for (unsigned leaf : cut.leaves) Abc_ObjAddFanin(Abc_NtkCreatePo(miter), orig[leaf]);
+    Abc_ObjAddFanin(Abc_NtkCreatePo(miter), mu);
+    for (unsigned root : cut.roots) Abc_ObjAddFanin(Abc_NtkCreatePo(miter), orig[root]);
+    aig = Lsv_KlToAig(miter);
+    Abc_NtkDelete(miter);
 
-  Aig_Man_t* aig = Abc_NtkToDar(miter, 0, 0);
-  int nPis = Abc_NtkPiNum(ntk);
-
-  // The PI literals that gate the roots, highest PI first (see Lsv_KlChain).
-  std::map<int, int> lits;
-  std::vector<std::map<int, int>> cubes(m);
-  for (int j = 0; j < m; ++j)
-    if (Lsv_KlGateCube(ntk, order, cut.roots[j], tfo, cubes[j])) lits.insert(cubes[j].begin(), cubes[j].end());
-    else cubes[j].clear();
-  std::vector<std::pair<int, int>> chain(lits.rbegin(), lits.rend());
-  std::vector<int> piIndex(orig.size(), -1);
-  Abc_NtkForEachPi(ntk, obj, i) piIndex[Abc_ObjId(obj)] = i;
-
-  // Random simulation finds most produced u, their root values, and most c
-  // that a PO can observe; SAT is only asked about the rest.
-  std::vector<char> seen(masks.size());
-  std::vector<unsigned> orig_c(masks.size()), observed(masks.size());
-  std::vector<uint64_t> val(Aig_ManObjNumMax(aig));
-  std::vector<int> rootTfo;  // nodes that depend on the root values, topological
-  {
+    val.assign(Aig_ManObjNumMax(aig), 0);
     std::vector<char> dep(Aig_ManObjNumMax(aig));
     for (int j = 0; j < m; ++j) dep[Aig_ManCi(aig, nPis + j)->Id] = 1;
     Aig_Obj_t* o;
-    int k;
-    Aig_ManForEachNode(aig, o, k) if (dep[Aig_ObjFaninId0(o)] || dep[Aig_ObjFaninId1(o)]) {
-      dep[k] = 1;
-      rootTfo.push_back(k);
+    Aig_ManForEachNode(aig, o, i) if (dep[Aig_ObjFaninId0(o)] || dep[Aig_ObjFaninId1(o)]) {
+      dep[i] = 1;
+      rootTfo.push_back(i);
     }
   }
-  std::mt19937_64 rng(1);
-  auto co = [&](int i) {
+
+  // The PI literals that gate the roots (see Lsv_KlChain).
+  void FindChain() {
+    std::map<int, int> lits;
+    cubes.resize(m);
+    for (int j = 0; j < m; ++j)
+      if (Lsv_KlGateCube(ntk, order, cut.roots[j], tfo, cubes[j])) lits.insert(cubes[j].begin(), cubes[j].end());
+      else cubes[j].clear();
+    chain.assign(lits.rbegin(), lits.rend());
+    oc.cubes = &cubes;
+  }
+
+  uint64_t Co(int i) const {
     Aig_Obj_t* o = Aig_ManCo(aig, i);
     return val[Aig_ObjFaninId0(o)] ^ (Aig_ObjFaninC0(o) ? ~uint64_t(0) : 0);
-  };
-  std::vector<std::vector<char>> point(masks.size());  // an input pattern with U = u
-  long gain = 0;  // new (u, c) facts found by simulation
-  auto simWord = [&]() {  // PI words are set by the caller
+  }
+
+  // Simulates the PI words in val for every c and records what they show.
+  void SimWord() {
     std::vector<uint64_t> leafVal(n), rootVal(m);
+    auto eval = [&](Aig_Obj_t* o) {
+      val[o->Id] = (val[Aig_ObjFaninId0(o)] ^ (Aig_ObjFaninC0(o) ? ~uint64_t(0) : 0)) &
+                   (val[Aig_ObjFaninId1(o)] ^ (Aig_ObjFaninC1(o) ? ~uint64_t(0) : 0));
+    };
     for (unsigned c = 0; c < (1u << m); ++c) {
       for (int j = 0; j < m; ++j)
         val[Aig_ManCi(aig, nPis + j)->Id] = (c >> (m - 1 - j)) & 1 ? ~uint64_t(0) : 0;
       val[Aig_ManConst1(aig)->Id] = ~uint64_t(0);
-      auto eval = [&](Aig_Obj_t* o) {
-        val[o->Id] = (val[Aig_ObjFaninId0(o)] ^ (Aig_ObjFaninC0(o) ? ~uint64_t(0) : 0)) &
-                     (val[Aig_ObjFaninId1(o)] ^ (Aig_ObjFaninC1(o) ? ~uint64_t(0) : 0));
-      };
       // The rest of the network does not depend on c: simulated once per word.
       Aig_Obj_t* o;
       int i;
       if (c == 0) Aig_ManForEachNode(aig, o, i) eval(o);
       else for (int k : rootTfo) eval(Aig_ManObj(aig, k));
       if (c == 0) {
-        for (int j = 0; j < n; ++j) leafVal[j] = co(j);
-        for (int j = 0; j < m; ++j) rootVal[j] = co(n + 1 + j);
+        for (int j = 0; j < n; ++j) leafVal[j] = Co(j);
+        for (int j = 0; j < m; ++j) rootVal[j] = Co(n + 1 + j);
       }
-      uint64_t mu = co(n);
+      uint64_t mu = Co(n);
       for (int bit = 0; bit < 64; ++bit) {
         unsigned u = 0, r = 0;
         for (int j = 0; j < n; ++j) u = u << 1 | ((leafVal[j] >> bit) & 1);
@@ -1810,72 +1848,74 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
           seen[u] = 1;
           orig_c[u] = r;
           if (point[u].empty())
-            for (int i = 0; i < nPis; ++i) point[u].push_back((val[Aig_ManCi(aig, i)->Id] >> bit) & 1);
+            for (int k = 0; k < nPis; ++k) point[u].push_back((val[Aig_ManCi(aig, k)->Id] >> bit) & 1);
         }
         if (((mu >> bit) & 1) && !((observed[u] >> c) & 1)) observed[u] |= 1u << c, ++gain;
       }
     }
-  };
-  // Uniform, sparse and dense words: arithmetic circuits hide many differences
-  // behind operands with long runs of 0s or 1s. Without a chain, stop once 16
-  // words in a row find nothing new: the rest goes to SAT anyway.
-  for (int word = 0, last = 0; word < 256; ++word) {
-    if (chain.empty() && word % 16 == 0) {
-      if (word >= 32 && gain == last) break;
-      last = gain;
-    }
-    for (int i = 0; i < nPis; ++i) {
-      uint64_t r = rng();
-      if (word % 4 == 1) r &= rng() & rng();
-      if (word % 4 == 2) r |= rng() | rng();
-      if (word % 4 == 3) r &= rng() & rng() & rng() & rng();
-      val[Aig_ManCi(aig, i)->Id] = r;
-    }
-    simWord();
   }
-  // Differences at the roots only show where their gate literals hold (e.g. a
-  // tiny divisor): random patterns with all but the last few of them true.
-  for (int word = 0; !chain.empty() && word < 128; ++word) {
-    for (int i = 0; i < nPis; ++i) {
-      uint64_t r = rng();
-      if (word % 3 == 1) r &= rng() & rng();
-      if (word % 3 == 2) r |= rng() | rng();
-      val[Aig_ManCi(aig, i)->Id] = r;
+
+  // Random simulation finds most produced u, their root values, and most c
+  // that a PO can observe; SAT is only asked about the rest.
+  void SimRandom() {
+    // Without a chain, stop once 16 words in a row find nothing new: the rest
+    // goes to SAT anyway.
+    for (int word = 0, last = 0; word < 256; ++word) {
+      if (chain.empty() && word % 16 == 0) {
+        if (word >= 32 && gain == last) break;
+        last = gain;
+      }
+      for (int i = 0; i < nPis; ++i) val[Aig_ManCi(aig, i)->Id] = Lsv_RandWord(rng, word);
+      SimWord();
     }
-    for (int k = 0; k + word % 9 < (int)chain.size(); ++k)
-      val[Aig_ManCi(aig, piIndex[chain[k].first])->Id] = chain[k].second ? ~uint64_t(0) : 0;
-    simWord();
+    // Differences at the roots only show where their gate literals hold (e.g. a
+    // tiny divisor): random patterns with all but the last few of them true.
+    std::vector<int> piIndex(N, -1);
+    Abc_Obj_t* obj;
+    int i;
+    Abc_NtkForEachPi(ntk, obj, i) piIndex[Abc_ObjId(obj)] = i;
+    for (int word = 0; !chain.empty() && word < 128; ++word) {
+      for (int k = 0; k < nPis; ++k) {
+        uint64_t r = rng();
+        if (word % 3 == 1) r &= rng() & rng();
+        if (word % 3 == 2) r |= rng() | rng();
+        val[Aig_ManCi(aig, k)->Id] = r;
+      }
+      for (int k = 0; k + word % 9 < (int)chain.size(); ++k)
+        val[Aig_ManCi(aig, piIndex[chain[k].first])->Id] = chain[k].second ? ~uint64_t(0) : 0;
+      SimWord();
+    }
   }
+
   // Random patterns rarely observe V in deep arithmetic. A SAT counterexample
   // does, and so do many of its neighbours, often for other u and c as well;
   // when 4 words in a row find nothing new, the rest would not either.
-  auto simNear = [&](const std::vector<char>& x, int words) {
+  void SimNear(const std::vector<char>& x, int words) {
     for (int word = 0, last = 0; word < words; ++word) {
       if (word % 4 == 0) {
         if (word && gain == last) break;
         last = gain;
       }
-      std::vector<uint64_t> w(nPis);
-      for (int i = 0; i < nPis; ++i) w[i] = x[i] ? ~uint64_t(0) : 0;
-      for (int bit = 1; bit < 64; ++bit)
-        for (int k = 0; k <= bit % 3; ++k) w[rng() % nPis] ^= uint64_t(1) << bit;
+      std::vector<uint64_t> w = Lsv_NearWords(x, nPis, rng);
       for (int i = 0; i < nPis; ++i) val[Aig_ManCi(aig, i)->Id] = w[i];
-      simWord();
+      SimWord();
     }
-  };
+  }
 
-  std::map<unsigned, std::unique_ptr<LsvKlSat>> sweeps;  // by flipped roots, built lazily
-  auto sweepFor = [&](unsigned fm) {
-    std::unique_ptr<LsvKlSat>& sw = sweeps[fm];
-    if (!sw) sw.reset(new LsvKlSat(ntk, order, cut, fm));
+  bool Observed(unsigned u, unsigned c) const { return (observed[u] >> c) & 1; }
+
+  LsvKlSat* SweepFor(unsigned flip) {
+    std::unique_ptr<LsvKlSat>& sw = sweeps[flip];
+    if (!sw) sw.reset(new LsvKlSat(ntk, order, cut, flip));
     return sw.get();
-  };
-  std::vector<std::array<unsigned, 3>> tasks;             // (u, cu, c) for the sweep
-  std::vector<std::array<unsigned, 3>> pending;           // (u, cu, c) left for batching
-  // SAT only for the u simulation never produced.
-  Cnf_Dat_t* cnf = nullptr;
-  sat_solver* sat = nullptr;
-  {
+  }
+
+  // Settles the u simulation never produced (SAT: is u produced at all?) and
+  // returns the (u, cu, c) no simulation has decided.
+  std::vector<Item> Tasks() {
+    std::vector<Item> tasks;
+    Cnf_Dat_t* cnf = nullptr;
+    sat_solver* sat = nullptr;
     for (unsigned u = 0; u < masks.size(); ++u) {
       if (!seen[u]) {
         if (!cnf) {
@@ -1898,51 +1938,25 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
         }
       }
       // Patterns near a point with U = u mostly keep U = u: more chances to observe c.
-      if (observed[u] != full) simNear(point[u], 16);
+      if (observed[u] != full) SimNear(point[u], 16);
       masks[u] = 1u << orig_c[u];  // the original root values are always fine
       for (unsigned c = 0; c < (1u << m); ++c)
-        if (c != orig_c[u] && !((observed[u] >> c) & 1)) tasks.push_back({u, orig_c[u], c});
+        if (c != orig_c[u] && !Observed(u, c)) tasks.push_back({u, orig_c[u], c});
     }
-    LsvKlConst oc;
-    oc.cubes = &cubes;
-    // Root j with gate cube G_j is unobservable where G_j fails, so there
-    // c acts like c2 = c with root j back at cu. Hence if c2 is allowed, only
-    // the single case G_j remains; and a counterexample of c2 found there is
-    // often one of c as well (checked by simulation).
-    std::function<int(unsigned, unsigned, unsigned, std::vector<char>&)> solve =
-        [&](unsigned u, unsigned cu, unsigned c, std::vector<char>& cex) {
-          LsvKlSat* sw = sweepFor(cu ^ c);
-          if (chain.empty()) return sw->Query(u, cu, c, cex, 2000);
-          int q = Lsv_KlChain(ntk, order, cut, u, cu, c, chain, 1000000, cex, oc);
-          if (q >= 0) return q;
-          for (int j = 0; j < m; ++j) {
-            unsigned bit = 1u << (m - 1 - j), c2 = c ^ bit;
-            if (!((cu ^ c) & bit) || cubes[j].empty()) continue;
-            std::vector<char> x;
-            int q2 = c2 == cu ? 1 : solve(u, cu, c2, x);
-            if (q2 == 1) {
-              std::vector<int> pc(orig.size(), -1);
-              for (const auto& kv : cubes[j]) pc[kv.first] = kv.second;
-              q = Lsv_KlCase(ntk, order, cut, u, cu, c, pc, 1000000, cex, oc);
-              if (q >= 0) return q;
-            } else if (q2 == 0 && !x.empty()) {
-              simNear(x, 1);
-              if ((observed[u] >> c) & 1) return 0;
-            }
-            break;
-          }
-          q = sw->Query(u, cu, c, cex, 200);
-          if (q < 0) q = sw->Query(u, cu, c, cex, 2000);
-          return q;
-        };
-    // Without a chain, first try to prove all of the cut's queries in one
-    // sweep; a counterexample rules one of them out, then try the rest again.
-    while (chain.empty() && tasks.size() >= 2) {
-      unsigned fm = 0;
-      for (const auto& t : tasks) fm |= t[1] ^ t[2];
+    if (sat) sat_solver_delete(sat);
+    if (cnf) Cnf_DataFree(cnf);
+    return tasks;
+  }
+
+  // Without a chain, first try to prove all of the cut's queries in one sweep;
+  // a counterexample rules one of them out, then try the rest again.
+  void SolveTogether(std::vector<Item>& tasks) {
+    while (tasks.size() >= 2) {
+      unsigned flip = 0;
+      for (const auto& t : tasks) flip |= t[1] ^ t[2];
       std::vector<char> cex;
       int bad = -1;
-      int q = sweepFor(fm)->Query(tasks, cex, 2000, &bad);
+      int q = SweepFor(flip)->Query(tasks, cex, 2000, &bad);
       if (q < 0) break;
       if (q == 1) {
         for (const auto& t : tasks) masks[t[0]] |= 1u << t[2];
@@ -1950,12 +1964,48 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
         break;
       }
       if (cex.empty() || bad < 0) break;  // a flipped root drives a PO: no single culprit
-      simNear(cex, 4);
-      std::vector<std::array<unsigned, 3>> rest;
+      SimNear(cex, 4);
+      std::vector<Item> rest;
       for (size_t i = 0; i < tasks.size(); ++i)
-        if ((int)i != bad && !((observed[tasks[i][0]] >> tasks[i][2]) & 1)) rest.push_back(tasks[i]);
+        if ((int)i != bad && !Observed(tasks[i][0], tasks[i][2])) rest.push_back(tasks[i]);
       tasks.swap(rest);
     }
+  }
+
+  // One query with bounded budgets: 1, 0 (cex set if found) or -1.
+  // Root j with gate cube G_j is unobservable where G_j fails, so there
+  // c acts like c2 = c with root j back at cu. Hence if c2 is allowed, only
+  // the single case G_j remains; and a counterexample of c2 found there is
+  // often one of c as well (checked by simulation).
+  int Solve(unsigned u, unsigned cu, unsigned c, std::vector<char>& cex) {
+    LsvKlSat* sw = SweepFor(cu ^ c);
+    if (chain.empty()) return sw->Query(u, cu, c, cex, 2000);
+    int q = Lsv_KlChain(ntk, order, cut, u, cu, c, chain, 1000000, cex, oc);
+    if (q >= 0) return q;
+    for (int j = 0; j < m; ++j) {
+      unsigned bit = 1u << (m - 1 - j), c2 = c ^ bit;
+      if (!((cu ^ c) & bit) || cubes[j].empty()) continue;
+      std::vector<char> x;
+      int q2 = c2 == cu ? 1 : Solve(u, cu, c2, x);
+      if (q2 == 1) {
+        std::vector<int> pc(N, -1);
+        for (const auto& kv : cubes[j]) pc[kv.first] = kv.second;
+        q = Lsv_KlCase(ntk, order, cut, u, cu, c, pc, 1000000, cex, oc);
+        if (q >= 0) return q;
+      } else if (q2 == 0 && !x.empty()) {
+        SimNear(x, 1);
+        if (Observed(u, c)) return 0;
+      }
+      break;
+    }
+    q = sw->Query(u, cu, c, cex, 200);
+    if (q < 0) q = sw->Query(u, cu, c, cex, 2000);
+    return q;
+  }
+
+  // The queries are independent: spread them over the cores. Returns those
+  // left undecided.
+  std::vector<Item> SolveEach(const std::vector<Item>& tasks) {
     // With a chain, the c of one u share their cases (and the cached constants
     // of the original PO): one child does them all.
     std::vector<std::vector<int>> byU;
@@ -1968,34 +2018,38 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
       }
       for (auto& kv : g) byU.push_back(kv.second);
     }
-    // The rest are independent: spread them over the cores with bounded
-    // budgets; batched fraig and the race below take what is left.
     std::vector<int> qs = Lsv_Pool(tasks.size(), workers, [&](int i) {
       std::vector<char> cex;
-      return solve(tasks[i][0], tasks[i][1], tasks[i][2], cex);
+      return Solve(tasks[i][0], tasks[i][1], tasks[i][2], cex);
     }, byU);
+    std::vector<Item> pending;
     for (size_t i = 0; i < tasks.size(); ++i) {
       if (qs[i] == 1) masks[tasks[i][0]] |= 1u << tasks[i][2];
       if (qs[i] < 0) pending.push_back(tasks[i]);
     }
-    // Batch what is left by the values of the PI leaves, which the miters fold.
+    return pending;
+  }
+
+  // Unbounded, exact: batched fraig, a large sweep, then a race of engines.
+  void SolveLeftovers(const std::vector<Item>& pending) {
+    // Batch by the values of the PI leaves, which the miters fold.
     unsigned piLeaves = 0;
     for (int j = 0; j < n; ++j)
       if (Abc_ObjIsPi(Abc_NtkObj(ntk, cut.leaves[j]))) piLeaves |= 1u << (n - 1 - j);
-    std::map<unsigned, std::vector<std::array<unsigned, 3>>> groups;
+    std::map<unsigned, std::vector<Item>> groups;
     for (const auto& it : pending) groups[it[0] & piLeaves].push_back(it);
     for (auto& g : groups) {
-      std::vector<std::array<unsigned, 3>> items;
+      std::vector<Item> items;
       for (const auto& it : g.second)
-        if (!((observed[it[0]] >> it[2]) & 1)) items.push_back(it);
+        if (!Observed(it[0], it[2])) items.push_back(it);
       std::vector<int> res = Lsv_Timed([&] { return Lsv_KlBatch(ntk, order, cut, items); },
                                        items.size(), 5000);
       for (size_t k = 0; k < items.size(); ++k) {
         unsigned u = items[k][0], cu = items[k][1], c = items[k][2];
-        if ((observed[u] >> c) & 1) continue;  // a later counterexample showed it
+        if (Observed(u, c)) continue;  // a later counterexample showed it
         int q = res[k];
         std::vector<char> cex;
-        LsvKlSat* sw = sweepFor(cu ^ c);
+        LsvKlSat* sw = SweepFor(cu ^ c);
         if (q < 0) q = sw->Query(u, cu, c, cex, 20000);
         // Each engine stalls on some of what is left, rarely all on the same
         // query: race them.
@@ -2022,16 +2076,16 @@ static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
           std::vector<char> x;
           q = Lsv_KlAllowed(ntk, order, cut, u, cu, c, x, 0);
         }
-        if (!cex.empty()) simNear(cex, 4);
+        if (!cex.empty()) SimNear(cex, 4);
         if (q == 1) masks[u] |= 1u << c;
       }
     }
   }
-  if (sat) sat_solver_delete(sat);
-  if (cnf) Cnf_DataFree(cnf);
-  Aig_ManStop(aig);
-  Abc_NtkDelete(miter);
-  return masks;
+};
+
+static std::vector<unsigned> Lsv_KlFlex(Abc_Ntk_t* ntk, Vec_Ptr_t* order,
+                                        const LsvKlCut& cut, size_t workers) {
+  return LsvKlFlex(ntk, order, cut, workers).Run();
 }
 
 // Prints the base cut and every cut obtained by adding non-output nodes of S as
