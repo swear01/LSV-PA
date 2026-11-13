@@ -1579,7 +1579,7 @@ static std::vector<int> Lsv_Timed(const std::function<std::vector<int>()>& f, si
   std::vector<int> res(n, -1), buf(n);
   size_t want = n * sizeof(int), got = 0;
   while (got < want) {
-    // ponytail: ms bounds each wait for data, not the total; fine for one result block.
+    // ms bounds each wait for data, not the total: enough for one result block.
     struct pollfd pfd = {fd[0], POLLIN, 0};
     if (poll(&pfd, 1, ms) <= 0) break;
     ssize_t k = read(fd[0], (char*)buf.data() + got, want - got);
